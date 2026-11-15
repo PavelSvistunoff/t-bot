@@ -1,6 +1,7 @@
 """Stable built-in tool names, shared by discovery and extension validation."""
 
 BASIC_TOOL_DESCRIPTIONS = {
+    "send_file": "Надсилання файлу з FILESYSTEM_ROOT вкладенням у поточний чат",
     "get_help": "Допомога / help: усі команди, інструменти та гайд із прикладами",
     "list_files": "Перегляд файлів і каталогів у FILESYSTEM_ROOT",
     "read_file": "Читання текстового UTF-8 файлу",

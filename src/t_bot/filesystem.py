@@ -133,6 +133,28 @@ class FileSystem:
             "truncated": offset + limit < len(content),
         }
 
+    def read_attachment(self, path: str, max_bytes: int) -> tuple[str, bytes]:
+        """Read a bounded regular binary file without following links or exposing internals."""
+        parts = self._parts(path)
+        if not parts:
+            raise BotError("Укажіть файл, а не каталог.")
+        with self._directory(parts[:-1]) as directory:
+            descriptor = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+            )
+            with os.fdopen(descriptor, "rb") as handle:
+                info = os.fstat(handle.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise BotError("Дозволені лише звичайні файли без жорстких посилань.")
+                if info.st_size > max_bytes:
+                    raise BotError("Файл перевищує ATTACHMENT_MAX_BYTES.")
+                data = handle.read(max_bytes + 1)
+        if not data:
+            raise BotError("Не можна надіслати порожній файл.")
+        if len(data) > max_bytes:
+            raise BotError("Файл перевищує ATTACHMENT_MAX_BYTES.")
+        return parts[-1], data
+
     def write_file(self, path: str, content: str) -> dict:
         parts = self._parts(path)
         if not parts:

@@ -24,7 +24,10 @@ class BasicTools:
         audit: Callable[[int, str, str], None],
         screenshot_sender: Callable[[], Awaitable[dict]] | None = None,
         help_provider: Callable[[], str] = render_help,
+        file_sender: Callable[[str, bytes], Awaitable[dict]] | None = None,
     ):
+        self.file_sender = file_sender
+        self.attachment_max_bytes = settings.attachment_max_bytes
         self.help_provider = help_provider
         self.authorize = authorize
         self.audit = audit
@@ -56,6 +59,7 @@ class BasicTools:
     def functions(self) -> list[Callable]:
         return [
             self.get_help,
+            self.send_file,
             self.list_files,
             self.read_file,
             self.write_file,
@@ -72,6 +76,27 @@ class BasicTools:
             self.take_screenshot,
             self.get_current_datetime,
         ]
+
+    async def send_file(self, path: str) -> dict:
+        """Send a local file as an attachment to the requesting user's current Telegram chat.
+
+        path must be inside FILESYSTEM_ROOT. Supports binary files up to ATTACHMENT_MAX_BYTES
+        (default 50 MB). No directories, links or protected files. Returns delivery metadata only.
+        Use only when the user requests a file. Delivery is not automatically retried.
+        """
+        user_id = self.authorize()
+        if self.file_sender is None:
+            return {"error": "Надсилання файлів недоступне: Telegram не підключено."}
+        self.audit(user_id, "attachment.read", path[:500])
+        try:
+            filename, data = await asyncio.to_thread(
+                self.filesystem.read_attachment, path, self.attachment_max_bytes
+            )
+            return await self.file_sender(filename, data)
+        except BotError as exc:
+            return {"error": str(exc)}
+        except OSError:
+            return {"error": "Не вдалося прочитати файл. Перевірте шлях, права та посилання."}
 
     async def get_help(self) -> dict:
         """Return the current guide to all commands, tools and active extensions.

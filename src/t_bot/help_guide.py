@@ -28,6 +28,8 @@ COMMAND_GUIDE = """Команди Telegram (надсилайте окремим 
 Також: «Котра година» або «Скока время»."""
 
 TOOL_EXAMPLES = {
+    "send_file": "Надішли reports/report.pdf вкладенням у цей чат. "
+    "Шлях відносний до FILESYSTEM_ROOT; до 50 МБ або меншого ATTACHMENT_MAX_BYTES.",
     "list_files": "Покажи файли в каталозі reports.",
     "read_file": "Прочитай reports/notes.txt; для великого файлу попросіть наступну частину.",
     "write_file": "Запиши текст «Привіт» у notes.txt. Наявний вміст буде замінено.",

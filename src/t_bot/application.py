@@ -33,6 +33,7 @@ async def run_worker(settings: Settings) -> int:
         jobs = Jobs(settings, store, runtime)
         adapter = TelegramAdapter(settings, store, ollama, extensions, jobs, restart)
         runtime.screenshot_sender = adapter.send_screenshot
+        runtime.file_sender = adapter.send_file
         try:
             jobs.start()
             await adapter.start()

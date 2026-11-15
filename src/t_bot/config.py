@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     extensions_dir: Path = Path("data/extensions")
     filesystem_root: Path = Path("workspace")
+    attachment_max_bytes: Annotated[int, Field(ge=1, le=50_000_000)] = 50_000_000
     filesystem_max_file_bytes: PositiveInt = 262144
     sqlite_database_dir: Path | None = None
     sqlite_query_timeout_seconds: PositiveInt = 5

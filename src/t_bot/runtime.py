@@ -86,6 +86,7 @@ class AgentRuntime:
         self.ollama = ollama
         self.extensions = extensions
         self.restart = restart
+        self.file_sender: Callable[[int, int, str, bytes], Awaitable[dict]] | None = None
         self.screenshot_sender: Callable[[int, int], Awaitable[dict]] | None = None
         self.basic_tools = BasicTools(
             settings,
@@ -93,6 +94,7 @@ class AgentRuntime:
             store.audit,
             self.send_screenshot,
             help_provider=lambda: render_help(r.manifest for r in extensions.records()),
+            file_sender=self.send_file,
         )
         self.sessions = DatabaseSessionService(
             db_url=f"sqlite+aiosqlite:///{settings.data_dir / 'sessions.sqlite3'}",
@@ -134,6 +136,15 @@ class AgentRuntime:
 
     def tool_user_id(self) -> int:
         return self.authorize_tool().user_id
+
+    async def send_file(self, filename: str, data: bytes) -> dict:
+        invocation = self.authorize_tool()
+        if self.file_sender is None:
+            return {"error": "Надсилання файлів недоступне: Telegram не підключено."}
+        try:
+            return await self.file_sender(invocation.user_id, invocation.chat_id, filename, data)
+        except BotError as exc:
+            return {"error": str(exc)}
 
     async def send_screenshot(self) -> dict:
         invocation = self.authorize_tool()
@@ -300,6 +311,8 @@ class AgentRuntime:
                 "та зміни моделей стають доступними з наступного повідомлення. "
                 "Делегуй спеціалізованим агентам через доступні інструменти агентів. "
                 "Не виконуй перезапуск без прохання користувача. Не передавай секрети у код. "
+                "Для надсилання файлу вкладенням у поточний чат використовуй send_file. "
+                "Викликай лише на прохання користувача; не вигадуй успішне надсилання. "
                 "Для файлів використовуй list_files, read_file, write_file, create_directory, "
                 "delete_file: шляхи відносні до FILESYSTEM_ROOT. "
                 "Для пошуку в інтернеті використовуй search_web і посилайся на URL джерел. "

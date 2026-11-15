@@ -93,6 +93,34 @@ class TelegramAdapter:
         )
         self.screenshot_lock = asyncio.Lock()
 
+    async def send_file(self, user_id: int, chat_id: int, filename: str, data: bytes) -> dict:
+        """Upload already validated bytes; never let Telegram interpret a local path or URL."""
+        self.settings.authorize(user_id)
+        if not data or len(data) > self.settings.attachment_max_bytes:
+            raise BotError("Розмір вкладення має бути від 1 до ATTACHMENT_MAX_BYTES байтів.")
+        self.store.audit(user_id, "attachment.send", str(chat_id))
+        try:
+            message = await self.application.bot.send_document(
+                chat_id=chat_id,
+                document=InputFile(data, filename=filename),
+                write_timeout=120,
+                read_timeout=30,
+            )
+        except TelegramError as exc:
+            raise BotError(
+                "Не вдалося підтвердити надсилання файлу. Перевірте чат і з’єднання; "
+                "запит автоматично не повторюється."
+            ) from exc
+        self.store.audit(user_id, "attachment.sent", str(chat_id))
+        return {
+            "status": "sent",
+            "chat_id": chat_id,
+            "message_id": message.message_id,
+            "filename": filename,
+            "size_bytes": len(data),
+            "delivery": "document",
+        }
+
     async def _send_screen_image(self, image: ScreenImage, chat_id: int) -> tuple[Message, str]:
         bot = self.application.bot
         if image.fits_telegram_photo:
