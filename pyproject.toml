@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "t-bot"
+version = "0.1.0"
+description = "Telegram bot with Google ADK, Ollama and isolated Python extensions"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "google-adk[db]==2.14.1",
+  "litellm==1.109.1",
+  "python-telegram-bot==22.8",
+  "httpx>=0.28,<0.29",
+  "pydantic-settings>=2.10,<3",
+  "aiosqlite>=0.21,<1",
+  "jsonschema>=4.26,<5",
+  "pip>=26.3,<27",
+  "ddgs>=9,<10",
+]
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "mypy>=1.18,<2"]
+
+[project.scripts]
+t-bot = "t_bot.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+markers = ["live: requires a running Ollama", "sandbox: requires OS sandbox support"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/t_bot"]
+check_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src", "/tests", "/examples", "/.github", "/README.md", "/TASK.md",
+  "/AGENTS.md", "/LICENSE", "/pyproject.toml", "/uv.lock", "/.env.example", "/start",
+]

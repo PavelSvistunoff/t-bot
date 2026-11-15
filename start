@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+PROJECT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$PROJECT_DIR"
+
+if [ ! -x .venv/bin/python ]; then
+    printf '%s\n' 'Відсутнє Python-середовище. Виконайте: uv sync --frozen --python 3.12' >&2
+    exit 1
+fi
+
+exec .venv/bin/python -m t_bot run "$@"

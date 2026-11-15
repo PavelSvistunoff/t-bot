@@ -1,0 +1,40 @@
+{
+  "id": "word_count",
+  "kind": "tool",
+  "version": 1,
+  "description": "Підраховує слова в тексті",
+  "entrypoint": "invoke",
+  "model": "gemma4:12b",
+  "parent": "root",
+  "dependencies": [],
+  "permissions": [],
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "text"
+    ],
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "properties": {
+      "count": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required": [
+      "count"
+    ],
+    "additionalProperties": false
+  },
+  "example": {
+    "text": "Привіт світе"
+  },
+  "example_usage": "Порахуй слова у тексті Привіт світе"
+}
