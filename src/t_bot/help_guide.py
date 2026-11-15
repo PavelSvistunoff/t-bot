@@ -28,6 +28,8 @@ COMMAND_GUIDE = """Команди Telegram (надсилайте окремим 
 Також: «Котра година» або «Скока время»."""
 
 TOOL_EXAMPLES = {
+    "install_dependencies": "Встанови six==1.17.0 для extensions. "
+    "Укажіть усі залежності з точними версіями й додайте той самий список у маніфест.",
     "send_file": "Надішли reports/report.pdf вкладенням у цей чат. "
     "Шлях відносний до FILESYSTEM_ROOT; до 50 МБ або меншого ATTACHMENT_MAX_BYTES.",
     "list_files": "Покажи файли в каталозі reports.",

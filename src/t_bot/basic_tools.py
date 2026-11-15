@@ -12,6 +12,7 @@ from t_bot.current_time import current_datetime
 from t_bot.errors import BotError
 from t_bot.filesystem import FileSystem
 from t_bot.help_guide import render_help
+from t_bot.manifest import validate_dependency_list
 from t_bot.sqlite_tools import SQLiteTools
 from t_bot.web_search import WebSearch
 
@@ -25,7 +26,9 @@ class BasicTools:
         screenshot_sender: Callable[[], Awaitable[dict]] | None = None,
         help_provider: Callable[[], str] = render_help,
         file_sender: Callable[[str, bytes], Awaitable[dict]] | None = None,
+        dependency_installer: Callable[[list[str]], Awaitable[None]] | None = None,
     ):
+        self.dependency_installer = dependency_installer
         self.file_sender = file_sender
         self.attachment_max_bytes = settings.attachment_max_bytes
         self.help_provider = help_provider
@@ -59,6 +62,7 @@ class BasicTools:
     def functions(self) -> list[Callable]:
         return [
             self.get_help,
+            self.install_dependencies,
             self.send_file,
             self.list_files,
             self.read_file,
@@ -76,6 +80,37 @@ class BasicTools:
             self.take_screenshot,
             self.get_current_datetime,
         ]
+
+    async def install_dependencies(self, dependencies: list[str]) -> dict:
+        """Install a complete dependency set for extensions, without changing the bot environment.
+
+        Supply up to 10 exact package==version entries, including transitive dependencies.
+        Only wheels are allowed. Empty ALLOWED_DEPENDENCIES allows all pinned packages;
+        otherwise every entry must be allowlisted. Repeated calls reuse the installed set.
+        To use it, put this same complete list in the extension manifest's dependencies;
+        this tool does not edit existing extensions. No shell options, URLs or local paths.
+        """
+        user_id = self.authorize()
+        if self.dependency_installer is None:
+            return {"error": "Інсталятор залежностей extensions не підключено."}
+        try:
+            packages = validate_dependency_list(dependencies)
+            if not packages:
+                raise BotError("Укажіть хоча б одну бібліотеку у форматі package==version.")
+            self.audit(user_id, "dependencies.install", ", ".join(packages))
+            await self.dependency_installer(packages)
+        except (BotError, ValueError) as exc:
+            return {"error": str(exc)}
+        except TimeoutError:
+            return {"error": "Перевищено час встановлення залежностей extensions."}
+        except OSError:
+            return {"error": "Не вдалося підготувати середовище залежностей extensions."}
+        return {
+            "status": "installed",
+            "dependencies": packages,
+            "usage": "Додайте цей повний список до dependencies маніфесту розширення. "
+            "Для наявного розширення створіть нову версію; поточний маніфест не змінено.",
+        }
 
     async def send_file(self, path: str) -> dict:
         """Send a local file as an attachment to the requesting user's current Telegram chat.

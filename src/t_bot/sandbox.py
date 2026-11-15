@@ -11,6 +11,7 @@ from pathlib import Path
 
 from t_bot.config import Settings
 from t_bot.errors import BotError
+from t_bot.manifest import validate_dependency_list
 
 MAX_OUTPUT_BYTES = 128_000
 
@@ -206,6 +207,10 @@ class Sandbox:
             return False
 
     async def provision(self, dependencies: list[str]) -> None:
+        try:
+            dependencies = validate_dependency_list(dependencies)
+        except ValueError as exc:
+            raise BotError(str(exc)) from exc
         if (
             self.settings.allowed_dependencies
             and not set(dependencies) <= self.settings.allowed_dependencies

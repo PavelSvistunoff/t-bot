@@ -95,6 +95,7 @@ class AgentRuntime:
             self.send_screenshot,
             help_provider=lambda: render_help(r.manifest for r in extensions.records()),
             file_sender=self.send_file,
+            dependency_installer=extensions.sandbox.provision,
         )
         self.sessions = DatabaseSessionService(
             db_url=f"sqlite+aiosqlite:///{settings.data_dir / 'sessions.sqlite3'}",
@@ -311,6 +312,8 @@ class AgentRuntime:
                 "та зміни моделей стають доступними з наступного повідомлення. "
                 "Делегуй спеціалізованим агентам через доступні інструменти агентів. "
                 "Не виконуй перезапуск без прохання користувача. Не передавай секрети у код. "
+                "Для встановлення Python-бібліотек розширень використовуй install_dependencies; "
+                "передай повний список package==version і збережи його в маніфесті розширення. "
                 "Для надсилання файлу вкладенням у поточний чат використовуй send_file. "
                 "Викликай лише на прохання користувача; не вигадуй успішне надсилання. "
                 "Для файлів використовуй list_files, read_file, write_file, create_directory, "

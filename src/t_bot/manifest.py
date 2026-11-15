@@ -7,6 +7,16 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from t_bot.tool_names import BASIC_TOOL_DESCRIPTIONS
 
 
+def validate_dependency_list(values: list[str]) -> list[str]:
+    """Accept at most ten pinned packages, without pip options, URLs or local paths."""
+    if len(values) > 10:
+        raise ValueError("At most 10 dependencies are allowed")
+    for value in values:
+        if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*==[a-zA-Z0-9_.+!-]+", value):
+            raise ValueError("Dependencies must use package==version without URLs or options")
+    return sorted(set(values))
+
+
 class Manifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -63,10 +73,7 @@ class Manifest(BaseModel):
     @field_validator("dependencies")
     @classmethod
     def validate_dependencies(cls, values: list[str]) -> list[str]:
-        for value in values:
-            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*==[a-zA-Z0-9_.+!-]+", value):
-                raise ValueError("Dependencies must use package==version without URLs or options")
-        return sorted(set(values))
+        return validate_dependency_list(values)
 
     @model_validator(mode="after")
     def validate_contract(self) -> "Manifest":
