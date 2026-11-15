@@ -1,4 +1,5 @@
 import socket
+from pathlib import Path
 
 import pytest
 
@@ -175,3 +176,35 @@ def invoke(payload: dict) -> dict:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert children and all(child.returncode is not None for child in children)
+
+
+@pytest.mark.parametrize("framework_exists", [True, False])
+def test_macos_framework_launcher_has_exact_execution_permissions(
+    settings, tmp_path, monkeypatch, framework_exists
+):
+    import json
+    import sys
+
+    from t_bot import sandbox
+
+    framework_root = tmp_path / "Python.framework/Versions/3.12"
+    interpreter = framework_root / "Resources/Python.app/Contents/MacOS/Python"
+    if framework_exists:
+        interpreter.parent.mkdir(parents=True)
+        interpreter.touch()
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "base_prefix", str(framework_root))
+    monkeypatch.setattr(sandbox.sysconfig, "get_config_var", lambda name: "Python")
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name: "/usr/bin/sandbox-exec")
+    command = Sandbox(settings).command(tmp_path, tmp_path / "dependencies")
+    profile = command[2]
+    execution_rule = next(
+        rule for rule in profile.split("(allow ") if rule.startswith("process-exec ")
+    )
+    if framework_exists:
+        assert f"(literal {json.dumps(str(interpreter))})" in execution_rule
+    else:
+        assert str(interpreter) not in execution_rule
+    assert f"(literal {json.dumps(str(Path(sys.executable).resolve()))})" in execution_rule
+    assert "(allow process-fork)" not in profile
+    assert '(subpath "/")' not in profile

@@ -5,6 +5,7 @@ import hashlib
 import json
 import shutil
 import sys
+import sysconfig
 import tempfile
 from pathlib import Path
 
@@ -143,6 +144,23 @@ class Sandbox:
             writable = " ".join(
                 f"(subpath {json.dumps(str(directory / name))})" for name in writable_names
             )
+            executables = [Path(python).resolve()]
+            framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
+            if framework:
+                # Framework Python's launcher replaces itself with the bundled interpreter.
+                # Permit that exact executable, while process-fork remains denied.
+                interpreter = (
+                    Path(sys.base_prefix)
+                    / "Resources"
+                    / f"{framework}.app"
+                    / "Contents/MacOS"
+                    / framework
+                )
+                if interpreter.is_file():
+                    executables.append(interpreter.resolve())
+            executable_literals = " ".join(
+                f"(literal {json.dumps(str(path))})" for path in executables
+            )
             profile = (
                 "(version 1)(deny default)(allow signal (target self))"
                 "(allow sysctl-read)"
@@ -153,7 +171,7 @@ class Sandbox:
                 '(literal "/dev/urandom") (literal "/dev/random") (literal "/dev/null"))'
                 f'(allow file-write* {writable} (literal "/dev/null"))'
                 f"(allow file-read* {writable})"
-                f"(allow process-exec (literal {json.dumps(str(Path(python).resolve()))}))"
+                f"(allow process-exec {executable_literals})"
             )
             return ["/usr/bin/sandbox-exec", "-p", profile, python, "-I", worker]
         if sys.platform.startswith("linux") and shutil.which("bwrap"):

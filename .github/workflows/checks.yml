@@ -3,8 +3,17 @@ on: [push, pull_request]
 jobs:
   checks:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-preference: [only-system, only-managed]
+    env:
+      UV_PYTHON_PREFERENCE: ${{ matrix.python-preference }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --frozen --python 3.12
       - run: uv run ruff check src tests examples

@@ -371,6 +371,12 @@ uv run t-bot run
 
 ## Розробка й перевірки
 
+GitHub Actions запускає перевірки на macOS для системного Python 3.12
+(`actions/setup-python`) та керованого `uv` Python. Для framework-збірки sandbox
+дозволяє виконання launcher та точного шляху інтерпретатора всередині `Python.app`;
+створення дочірніх процесів розширеннями залишається забороненим.
+
+
 ```sh
 uv sync --frozen
 uv run ruff check src tests
