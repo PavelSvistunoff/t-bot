@@ -53,7 +53,12 @@ def literal_instruction(context: ReadonlyContext, *, text: str) -> str:
 
 class ExtensionTool(BaseTool):
     def __init__(self, extensions: Extensions, record: ExtensionRecord):
-        super().__init__(name=record.manifest.id, description=record.manifest.description)
+        super().__init__(
+            name=record.manifest.id,
+            description=record.manifest.description + " File paths are relative to FILESYSTEM_ROOT "
+            "(the tool's working directory), or absolute inside it. Use example.txt, not "
+            "workspace/example.txt, for a file at the workspace root.",
+        )
         self.extensions = extensions
         self.record = record
 

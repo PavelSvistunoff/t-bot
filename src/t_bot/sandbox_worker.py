@@ -98,6 +98,7 @@ def main() -> None:
     os.environ["HOME"] = os.environ["TMPDIR"]
     if request.get("filesystem_root"):
         os.environ["FILESYSTEM_ROOT"] = request["filesystem_root"]
+        os.chdir(request["filesystem_root"])
     else:
         os.environ.pop("FILESYSTEM_ROOT", None)
     sys.path.insert(0, request["dependencies"])

@@ -328,7 +328,6 @@ class Sandbox:
             isolated = await asyncio.to_thread(Path(temporary).resolve)
             (isolated / "tmp").mkdir()
             root = await asyncio.to_thread(self.workspace_root)
-            (isolated / "workspace").symlink_to(root, target_is_directory=True)
             if directory:
                 shutil.copyfile(directory / "extension.py", isolated / "extension.py")
             request = {

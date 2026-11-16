@@ -121,7 +121,7 @@ async def test_workspace_available_without_explicit_permission(settings, tmp_pat
 def invoke(payload: dict) -> dict:
     """Write only to explicitly allowed persistent workspace."""
     try:
-        Path("workspace/result.txt").write_text("temporary")
+        Path("result.txt").write_text("temporary")
         return {"written": True}
     except OSError:
         return {"written": False}
@@ -226,7 +226,7 @@ def invoke(payload: dict) -> dict:
     output = root / "output.txt"
     previous = output.read_text() if output.exists() else ""
     output.write_text(previous + root.joinpath("input.txt").read_text())
-    return {"text": Path("workspace/output.txt").read_text(), "root": str(root)}
+    return {"text": Path("output.txt").read_text(), "root": str(root)}
 '''
     first = await run_code(settings, tmp_path, code, permissions=[])
     second = await run_code(settings, tmp_path, code, permissions=[])
@@ -250,7 +250,7 @@ def invoke(payload: dict) -> dict:
     result = {}
     for name in [".env.production", "external-link"]:
         try:
-            result[name] = Path("workspace/nested", name).read_text()
+            result[name] = Path("nested", name).read_text()
         except OSError:
             result[name] = "denied"
     return result
@@ -288,3 +288,25 @@ def invoke(payload: dict) -> dict:
         "text": "visible",
         "environment": str(settings.filesystem_root),
     }
+
+
+async def test_relative_paths_use_workspace_at_import_and_invocation(settings, tmp_path):
+    settings.filesystem_root.mkdir()
+    (settings.filesystem_root / "example.txt").write_text("one two three", encoding="utf-8")
+    code = '''from pathlib import Path
+
+IMPORTED_TEXT = Path("example.txt").read_text(encoding="utf-8")
+
+def invoke(payload: dict) -> dict:
+    """Read an existing workspace file using a plain relative path."""
+    text = Path("example.txt").read_text(encoding="utf-8")
+    Path("result.txt").write_text(str(len(text.split())), encoding="utf-8")
+    return {"word_count": len(text.split()), "imported_text": IMPORTED_TEXT, "cwd": str(Path.cwd())}
+'''
+    result = await run_code(settings, tmp_path, code, permissions=[])
+    assert result == {
+        "word_count": 3,
+        "imported_text": "one two three",
+        "cwd": str(settings.filesystem_root),
+    }
+    assert (settings.filesystem_root / "result.txt").read_text() == "3"
