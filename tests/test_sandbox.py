@@ -310,3 +310,48 @@ def invoke(payload: dict) -> dict:
         "cwd": str(settings.filesystem_root),
     }
     assert (settings.filesystem_root / "result.txt").read_text() == "3"
+
+
+@pytest.mark.parametrize("permissions,connected", [([], False), (["network"], True)])
+async def test_network_permission_allows_dns_and_connection_but_not_fork(
+    settings, tmp_path, permissions, connected
+):
+    import asyncio
+
+    async def reply(reader, writer):
+        try:
+            await reader.readexactly(4)
+            writer.write(b"PONG")
+            await writer.drain()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(reply, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    code = f'''import os, socket
+
+def invoke(payload: dict) -> dict:
+    """Probe opt-in network access without granting process creation."""
+    try:
+        socket.getaddrinfo("localhost", {port})
+        with socket.create_connection(("127.0.0.1", {port}), timeout=2) as connection:
+            connection.sendall(b"PING")
+            connected = connection.recv(4) == b"PONG"
+    except OSError:
+        connected = False
+    try:
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        fork = True
+    except OSError:
+        fork = False
+    return {{"connected": connected, "fork": fork}}
+'''
+    async with server:
+        assert await run_code(settings, tmp_path, code, permissions=permissions) == {
+            "connected": connected,
+            "fork": False,
+        }

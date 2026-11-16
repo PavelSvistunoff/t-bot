@@ -71,6 +71,7 @@ def render_help(manifests: Iterable[Manifest] = ()) -> str:
         "restart_bot — перезапустити бота; приклад: «Перезапусти себе».\n"
         "create_extension — створити Python-інструмент, агента чи субагента з ADK. "
         "Передайте dependencies із назвами основних бібліотек; pip визначить решту. "
+        "Для зовнішнього API вкажіть permissions=[network]. "
         "Для графіка з word_count використайте input_from=word_count; "
         "передавайте його char_frequency інструменту малювання.\n"
         "Приклад: «Створи інструмент word_counter для підрахунку слів у тексті».\n"

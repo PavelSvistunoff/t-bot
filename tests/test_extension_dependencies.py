@@ -84,7 +84,9 @@ async def test_invalid_or_disallowed_explicit_dependencies_fail_before_generatio
 async def test_create_extension_adk_schema_exposes_dependency_list(components):
     runtime, _, _, _ = components
     declaration = FunctionTool(runtime.create_extension)._get_declaration()
-    assert "dependencies" in declaration.parameters_json_schema["properties"]
+    assert {"dependencies", "input_from", "permissions"} <= set(
+        declaration.parameters_json_schema["properties"]
+    )
 
 
 @pytest.mark.parametrize("dependencies,expected", [(None, ["six==1.17.0"]), ([], [])])

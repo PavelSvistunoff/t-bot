@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal
 
 import jsonschema
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
 from t_bot.config import Settings
 from t_bot.dependencies import validate_requests
@@ -242,6 +242,7 @@ class Extensions:
         user_id: int,
         dependencies: list[str] | None = None,
         input_from: str = "",
+        permissions: list[str] | None = None,
     ) -> dict:
         self.settings.authorize(user_id)
         model = model or self.store.get("model:root", self.settings.default_model)
@@ -255,6 +256,9 @@ class Extensions:
             entrypoint="invoke" if kind == "tool" else "build_agent",
             example_usage=request[:2000],
             dependencies=[],
+            permissions=TypeAdapter(list[Literal["workspace", "network"]]).validate_python(
+                permissions if permissions is not None else ["workspace"]
+            ),
         )
         if dependencies is not None:
             requests = validate_requests(dependencies)
@@ -323,7 +327,11 @@ class Extensions:
             "Agents: build_agent(model: str, api_base: str) returns LlmAgent with LiteLlm "
             "ollama_chat/model. Only name, description, instruction, model constructor fields. "
             "No callbacks, sub_agents or tools in source; relationships are supplied by manifest. "
-            "Network and access to host files outside the workspace are forbidden. "
+            "Host files outside the workspace are forbidden. Network is disabled by default. "
+            "For tools fetching external APIs declare permissions=['network']. "
+            "Workspace is implicit. "
+            "Always set a finite HTTP timeout and handle failures explicitly; never report fake "
+            "zero measurements as successful data. Use the real API field names. "
             "All extensions have persistent workspace access by default, even with permissions=[]. "
             "The working directory is FILESYSTEM_ROOT: open('example.txt') reads a file there. "
             "os.environ['FILESYSTEM_ROOT'] provides its absolute path. Do not prefix relative "
@@ -343,6 +351,10 @@ class Extensions:
         }
         for field in ("id", "kind", "version", "parent", "model", "entrypoint"):
             schema["properties"]["manifest"]["properties"][field] = {"const": getattr(base, field)}
+        if permissions is not None:
+            schema["properties"]["manifest"]["properties"]["permissions"] = {
+                "const": base.permissions
+            }
         if dependencies is not None:
             schema["properties"]["manifest"]["properties"]["dependencies"] = {
                 "const": base.dependencies
@@ -352,6 +364,8 @@ class Extensions:
                 schema["properties"]["manifest"]["properties"][key] = {"const": getattr(base, key)}
         try:
             generated = json.loads(await self.ollama.generate(model, prompt, schema))
+            if permissions is not None:
+                generated["manifest"]["permissions"] = base.permissions
             if input_contract is not None:
                 generated["manifest"]["input_schema"] = base.input_schema
                 generated["manifest"]["example"] = base.example

@@ -232,6 +232,7 @@ class AgentRuntime:
         model: str = "",
         dependencies: list[str] | None = None,
         input_from: str = "",
+        permissions: list[str] | None = None,
     ) -> dict:
         """Create and activate Python ADK agent/subagent or tool from a request.
 
@@ -243,6 +244,8 @@ class AgentRuntime:
         the generator chooses and declares required packages. Installation happens automatically.
         input_from: existing producer tool ID, e.g. word_count; consume its output instead of
         recounting a file. For word_count plots the input is char_frequency, not file_path.
+        permissions: use ["network"] for external APIs; network is otherwise denied.
+        Workspace access is always available. Explicit [] prevents generated network permission.
         Existing ID creates a new version; failed validation leaves the previous version active.
         """
         invocation = self.authorize_tool()
@@ -256,6 +259,7 @@ class AgentRuntime:
                 invocation.user_id,
                 dependencies=dependencies,
                 input_from=input_from,
+                permissions=permissions,
             )
             result.pop("source", None)
             result["source_command"] = f"/source {extension_id}"
@@ -343,6 +347,10 @@ class AgentRuntime:
                 "Для файлів використовуй list_files, read_file, write_file, create_directory, "
                 "delete_file: шляхи відносні до FILESYSTEM_ROOT. "
                 "Для пошуку в інтернеті використовуй search_web і посилайся на URL джерел. "
+                "Для extensions із зовнішніми API передавай permissions=['network'] "
+                "до create_extension: без цього мережа sandbox заблокована. "
+                "Не трактуй помилку DNS як доведений збій серверу; спершу перевір дозволи. "
+                "Не повідомляй вигадані нульові вимірювання при помилці API. "
                 "Для SQLite використовуй list_databases, create_database, database_schema, "
                 "table_schema, execute_sql та execute_sql_script. state і session доступні "
                 "лише для читання; користувацькі бази мають повний SQL-доступ. "

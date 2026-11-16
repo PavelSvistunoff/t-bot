@@ -189,7 +189,7 @@ class Sandbox:
                         folders.remove(name)
         return hidden
 
-    def command(self, directory: Path, dependencies: Path) -> list[str]:
+    def command(self, directory: Path, dependencies: Path, *, network: bool = False) -> list[str]:
         worker = str(Path(__file__).with_name("sandbox_worker.py").resolve())
         python = str(Path(sys.executable).absolute())
         reads = self._read_paths(directory, dependencies)
@@ -230,6 +230,15 @@ class Sandbox:
                 f"(allow file-read* {writable})"
                 f"(allow process-exec {executable_literals})"
             )
+            if network:
+                profile += (
+                    "(allow network*)"
+                    '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))'
+                    '(allow file-read* (literal "/private/etc/hosts") '
+                    '(literal "/private/etc/resolv.conf") (literal "/private/etc/services") '
+                    '(literal "/private/etc/protocols") (literal "/private/etc/ssl/cert.pem") '
+                    '(subpath "/private/etc/ssl/certs"))'
+                )
             components = "|".join(re.escape(name) for name in sorted(BLOCKED_COMPONENTS))
             private_pattern = (
                 "^" + re.escape(str(root)) + "/(.*/)?(" + components + "|\\.env[^/]*)(/|$)"
@@ -256,7 +265,20 @@ class Sandbox:
                 "--tmpfs",
                 "/tmp",
             ]
-            for path in [Path("/usr"), Path("/lib"), Path("/lib64"), *reads]:
+            if network:
+                command += ["--share-net"]
+            network_files = (
+                [
+                    Path("/etc/resolv.conf"),
+                    Path("/etc/hosts"),
+                    Path("/etc/nsswitch.conf"),
+                    Path("/etc/ssl/certs"),
+                    Path("/etc/ssl/cert.pem"),
+                ]
+                if network
+                else []
+            )
+            for path in [Path("/usr"), Path("/lib"), Path("/lib64"), *reads, *network_files]:
                 if path.exists():
                     command += ["--ro-bind", str(path), str(path)]
             for name in writable_names:
@@ -354,6 +376,7 @@ class Sandbox:
                         self.command,
                         isolated,
                         self.dependency_path(dependencies),
+                        network="network" in manifest.get("permissions", []),
                     ),
                     input_data=data,
                     timeout_seconds=self.settings.sandbox_timeout_seconds,

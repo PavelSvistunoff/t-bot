@@ -1,0 +1,55 @@
+{
+  "id": "weather_cherkasy",
+  "kind": "tool",
+  "version": 1,
+  "description": "Поточна погода в Черкасах з Open-Meteo: температура, швидкість вітру та WMO-код.",
+  "entrypoint": "invoke",
+  "model": "gemma4:12b",
+  "parent": "root",
+  "dependencies": [],
+  "permissions": [
+    "network"
+  ],
+  "input_schema": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "output_schema": {
+    "type": "object",
+    "oneOf": [
+      {
+        "properties": {
+          "temperature": {
+            "type": "number"
+          },
+          "wind_speed": {
+            "type": "number"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "temperature",
+          "wind_speed",
+          "description"
+        ],
+        "additionalProperties": false
+      },
+      {
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "additionalProperties": false
+      }
+    ]
+  },
+  "example": {},
+  "example_usage": "Виклич weather_cherkasy без параметрів."
+}
