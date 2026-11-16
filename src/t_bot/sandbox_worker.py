@@ -96,6 +96,10 @@ def main() -> None:
         resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
     os.environ["TMPDIR"] = str(Path(request["directory"]) / "tmp")
     os.environ["HOME"] = os.environ["TMPDIR"]
+    if request.get("filesystem_root"):
+        os.environ["FILESYSTEM_ROOT"] = request["filesystem_root"]
+    else:
+        os.environ.pop("FILESYSTEM_ROOT", None)
     sys.path.insert(0, request["dependencies"])
     # Keep the protocol channel separate from arbitrary extension print statements.
     with contextlib.redirect_stdout(sys.stderr):

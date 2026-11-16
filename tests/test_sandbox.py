@@ -46,7 +46,10 @@ async def test_probe_and_real_tool(settings, tmp_path):
     assert result == {"answer": 42}
 
 
-async def test_secret_files_environment_network_and_fork_denied(settings, tmp_path, monkeypatch):
+@pytest.mark.parametrize("permissions", [[], ["workspace"]])
+async def test_secret_files_environment_network_and_fork_denied(
+    settings, tmp_path, monkeypatch, permissions
+):
     secret = tmp_path / "secret.txt"
     secret.write_text("PRIVATE")
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "DO-NOT-LEAK")
@@ -79,7 +82,7 @@ def invoke(payload: dict) -> dict:
         result["fork"] = "denied"
     return result
 '''
-        result = await run_code(settings, tmp_path, code)
+        result = await run_code(settings, tmp_path, code, permissions=permissions)
     assert result == {"token": None, "file": "denied", "network": "denied", "fork": "denied"}
 
 
@@ -112,19 +115,20 @@ async def test_output_limit(settings, tmp_path):
         )
 
 
-async def test_workspace_requires_permission(settings, tmp_path):
+async def test_workspace_available_without_explicit_permission(settings, tmp_path):
     code = '''from pathlib import Path
 
 def invoke(payload: dict) -> dict:
-    """Write only to explicitly allowed temporary workspace."""
+    """Write only to explicitly allowed persistent workspace."""
     try:
         Path("workspace/result.txt").write_text("temporary")
         return {"written": True}
     except OSError:
         return {"written": False}
 '''
-    assert await run_code(settings, tmp_path, code) == {"written": False}
+    assert await run_code(settings, tmp_path, code, permissions=[]) == {"written": True}
     assert await run_code(settings, tmp_path, code, permissions=["workspace"]) == {"written": True}
+    assert (settings.filesystem_root / "result.txt").read_text() == "temporary"
 
 
 async def test_memory_limit_is_enforced(settings, tmp_path):
@@ -208,3 +212,79 @@ def test_macos_framework_launcher_has_exact_execution_permissions(
     assert f"(literal {json.dumps(str(Path(sys.executable).resolve()))})" in execution_rule
     assert "(allow process-fork)" not in profile
     assert '(subpath "/")' not in profile
+
+
+async def test_workspace_environment_and_files_persist_between_invocations(settings, tmp_path):
+    settings.filesystem_root.mkdir()
+    (settings.filesystem_root / "input.txt").write_text("user input")
+    code = '''import os
+from pathlib import Path
+
+def invoke(payload: dict) -> dict:
+    """Read host workspace and persist output across isolated invocations."""
+    root = Path(os.environ["FILESYSTEM_ROOT"])
+    output = root / "output.txt"
+    previous = output.read_text() if output.exists() else ""
+    output.write_text(previous + root.joinpath("input.txt").read_text())
+    return {"text": Path("workspace/output.txt").read_text(), "root": str(root)}
+'''
+    first = await run_code(settings, tmp_path, code, permissions=[])
+    second = await run_code(settings, tmp_path, code, permissions=[])
+    assert first == {"text": "user input", "root": str(settings.filesystem_root)}
+    assert second["text"] == "user inputuser input"
+    assert (settings.filesystem_root / "output.txt").read_text() == second["text"]
+
+
+async def test_workspace_hides_secrets_and_external_links(settings, tmp_path):
+    settings.filesystem_root.mkdir()
+    nested = settings.filesystem_root / "nested"
+    nested.mkdir()
+    (nested / ".env.production").write_text("SECRET")
+    external = tmp_path / "external.txt"
+    external.write_text("PRIVATE")
+    (nested / "external-link").symlink_to(external)
+    code = '''from pathlib import Path
+
+def invoke(payload: dict) -> dict:
+    """Check private files cannot be read through the workspace."""
+    result = {}
+    for name in [".env.production", "external-link"]:
+        try:
+            result[name] = Path("workspace/nested", name).read_text()
+        except OSError:
+            result[name] = "denied"
+    return result
+'''
+    assert await run_code(settings, tmp_path, code, permissions=["workspace"]) == {
+        ".env.production": "denied",
+        "external-link": "denied",
+    }
+
+
+async def test_workspace_cannot_include_bot_state(settings, tmp_path):
+    settings.filesystem_root = tmp_path
+    with pytest.raises(BotError, match="FILESYSTEM_ROOT"):
+        await run_code(settings, tmp_path, "", permissions=["workspace"])
+
+
+@pytest.mark.parametrize("permissions", [[], ["workspace"]])
+async def test_absolute_workspace_path_is_available_by_default(settings, tmp_path, permissions):
+    settings.filesystem_root.mkdir()
+    target = settings.filesystem_root / "existing.txt"
+    target.write_text("visible")
+    code = f'''import os
+from pathlib import Path
+
+def invoke(payload: dict) -> dict:
+    """Probe absolute workspace access and environment capability."""
+    try:
+        text = Path({str(target)!r}).read_text()
+    except OSError:
+        text = "denied"
+    return {{"text": text, "environment": os.environ.get("FILESYSTEM_ROOT")}}
+'''
+    result = await run_code(settings, tmp_path, code, permissions=permissions)
+    assert result == {
+        "text": "visible",
+        "environment": str(settings.filesystem_root),
+    }

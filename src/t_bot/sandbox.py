@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import json
+import os
+import re
 import shutil
 import sys
 import sysconfig
@@ -11,6 +13,7 @@ from pathlib import Path
 
 from t_bot.config import Settings
 from t_bot.errors import BotError
+from t_bot.filesystem import BLOCKED_COMPONENTS
 from t_bot.manifest import validate_dependency_list
 
 MAX_OUTPUT_BYTES = 128_000
@@ -135,16 +138,59 @@ class Sandbox:
             )
         )
 
-    def command(self, directory: Path, dependencies: Path, *, workspace: bool = False) -> list[str]:
+    def workspace_root(self) -> Path:
+        """Validate a persistent workspace that cannot expose the host's private runtime state."""
+        root = self.settings.filesystem_root
+        if root.resolve() != root or any(
+            part.casefold() in BLOCKED_COMPONENTS or part.casefold().startswith(".env")
+            for part in root.parts
+        ):
+            raise BotError("FILESYSTEM_ROOT не може бути секретним каталогом або посиланням.")
+        protected = (
+            self.settings.data_dir,
+            self.settings.extensions_dir,
+            Path(sys.prefix).resolve(),
+            Path(sys.base_prefix).resolve(),
+            Path(__file__).parent.resolve(),
+            Path.cwd() / "AGENTS.md",
+        )
+        if any(root.is_relative_to(p) or p.is_relative_to(root) for p in protected):
+            raise BotError(
+                "FILESYSTEM_ROOT для extensions має бути окремим від стану, коду й Python "
+                "середовища бота; виберіть окремий робочий каталог."
+            )
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return root
+
+    def private_workspace_paths(self, root: Path) -> list[Path]:
+        """Find existing private entries to hide in a Linux workspace bind mount."""
+        hidden = []
+        for directory, folders, files in os.walk(root, followlinks=False):
+            for name in [*folders, *files]:
+                path = Path(directory) / name
+                private = name.casefold() in BLOCKED_COMPONENTS or name.casefold().startswith(
+                    ".env"
+                )
+                if path.is_symlink():
+                    continue  # Targets outside the mounted workspace remain inaccessible.
+                if private or (path.is_file() and path.stat().st_nlink > 1):
+                    hidden.append(path)
+                    if name in folders:
+                        folders.remove(name)
+        return hidden
+
+    def command(self, directory: Path, dependencies: Path) -> list[str]:
         worker = str(Path(__file__).with_name("sandbox_worker.py").resolve())
         python = str(Path(sys.executable).absolute())
         reads = self._read_paths(directory, dependencies)
-        writable_names = ("tmp", "workspace") if workspace else ("tmp",)
+        writable_names = ("tmp",)
+        root = self.workspace_root()
         if sys.platform == "darwin" and shutil.which("sandbox-exec"):
             literals = " ".join(f"(subpath {json.dumps(str(path))})" for path in reads)
             writable = " ".join(
                 f"(subpath {json.dumps(str(directory / name))})" for name in writable_names
             )
+            writable += f" (subpath {json.dumps(str(root))})"
             executables = [Path(python).resolve()]
             framework = sysconfig.get_config_var("PYTHONFRAMEWORK")
             if framework:
@@ -174,6 +220,16 @@ class Sandbox:
                 f"(allow file-read* {writable})"
                 f"(allow process-exec {executable_literals})"
             )
+            components = "|".join(re.escape(name) for name in sorted(BLOCKED_COMPONENTS))
+            private_pattern = (
+                "^" + re.escape(str(root)) + "/(.*/)?(" + components + "|\\.env[^/]*)(/|$)"
+            )
+            profile += (
+                f"(deny file-read* file-write* (regex {json.dumps(private_pattern)}))"
+                "(deny file-link)"
+            )
+            for path in self.private_workspace_paths(root):
+                profile += f"(deny file-read* file-write* (subpath {json.dumps(str(path))}))"
             return ["/usr/bin/sandbox-exec", "-p", profile, python, "-I", worker]
         if sys.platform.startswith("linux") and shutil.which("bwrap"):
             command = [
@@ -196,6 +252,12 @@ class Sandbox:
             for name in writable_names:
                 path = directory / name
                 command += ["--bind", str(path), str(path)]
+            command += ["--bind", str(root), str(root)]
+            for path in self.private_workspace_paths(root):
+                if path.is_dir():
+                    command += ["--tmpfs", str(path)]
+                else:
+                    command += ["--ro-bind", "/dev/null", str(path)]
             return command + ["--chdir", str(directory), python, "-I", worker]
         raise BotError("Ізоляція недоступна: потрібні macOS sandbox-exec або Linux bubblewrap.")
 
@@ -264,8 +326,9 @@ class Sandbox:
         await self.provision(dependencies)
         with tempfile.TemporaryDirectory(prefix="t-bot-isolated-") as temporary:
             isolated = await asyncio.to_thread(Path(temporary).resolve)
-            for name in ("tmp", "workspace"):
-                (isolated / name).mkdir()
+            (isolated / "tmp").mkdir()
+            root = await asyncio.to_thread(self.workspace_root)
+            (isolated / "workspace").symlink_to(root, target_is_directory=True)
             if directory:
                 shutil.copyfile(directory / "extension.py", isolated / "extension.py")
             request = {
@@ -273,6 +336,7 @@ class Sandbox:
                 "manifest": manifest,
                 "payload": payload,
                 "directory": str(isolated),
+                "filesystem_root": str(root),
                 "dependencies": str(self.dependency_path(dependencies)),
                 "timeout": self.settings.sandbox_timeout_seconds,
                 "memory_mb": self.settings.sandbox_memory_mb,
@@ -282,10 +346,10 @@ class Sandbox:
                 raise BotError("Завеликий запит до розширення.")
             try:
                 output = await bounded_process(
-                    self.command(
+                    await asyncio.to_thread(
+                        self.command,
                         isolated,
                         self.dependency_path(dependencies),
-                        workspace="workspace" in manifest.get("permissions", []),
                     ),
                     input_data=data,
                     timeout_seconds=self.settings.sandbox_timeout_seconds,
