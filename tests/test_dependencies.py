@@ -42,7 +42,7 @@ async def test_dependency_installation_rejected_for_nonmatching_list(
 
 @pytest.mark.parametrize("allowed", [set(), {"six==1.17.0"}])
 async def test_install_tool_prepares_reusable_manifest_environment(
-    components, settings, monkeypatch, allowed
+    components, settings, monkeypatch, allowed, pip_report
 ):
     from t_bot.runtime import Invocation, current_invocation
 
@@ -52,6 +52,7 @@ async def test_install_tool_prepares_reusable_manifest_environment(
 
     async def install(command, **kwargs):
         commands.append(command)
+        pip_report(command)
         return b""
 
     monkeypatch.setattr("t_bot.sandbox.bounded_process", install)
@@ -62,15 +63,15 @@ async def test_install_tool_prepares_reusable_manifest_environment(
         assert result["dependencies"] == ["six==1.17.0"]
         assert sandbox.dependency_path(result["dependencies"]).is_dir()
         await runtime.basic_tools.install_dependencies(result["dependencies"])
-        assert len(commands) == 1
-        assert "--only-binary=:all:" in commands[0] and "--no-deps" in commands[0]
-        assert "--target" in commands[0]
+        assert len(commands) == 2
+        assert "--only-binary=:all:" in commands[1] and "--no-deps" in commands[1]
+        assert "--target" in commands[1]
     finally:
         current_invocation.reset(token)
 
 
 @pytest.mark.parametrize(
-    "packages", [[], ["--target=/tmp"], ["six"], ["https://example.com/a.whl"], ["a==1"] * 11]
+    "packages", [[], ["--target=/tmp"], ["six>=1"], ["https://example.com/a.whl"], ["a==1"] * 65]
 )
 async def test_install_tool_rejects_invalid_requirements_before_pip(
     components, monkeypatch, packages
@@ -91,7 +92,7 @@ async def test_install_tool_rejects_invalid_requirements_before_pip(
 
 
 async def test_install_tool_checks_user_allowlist_and_recovers_after_failure(
-    components, settings, monkeypatch
+    components, settings, monkeypatch, pip_report
 ):
     from t_bot.runtime import Invocation, current_invocation
 
@@ -118,6 +119,7 @@ async def test_install_tool_checks_user_allowlist_and_recovers_after_failure(
         assert list(sandbox.dependencies_dir.iterdir()) == []
 
         async def success(command, **kwargs):
+            pip_report(command)
             return b""
 
         monkeypatch.setattr("t_bot.sandbox.bounded_process", success)

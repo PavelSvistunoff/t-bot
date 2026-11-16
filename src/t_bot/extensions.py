@@ -13,6 +13,7 @@ import jsonschema
 from pydantic import BaseModel, Field, ValidationError
 
 from t_bot.config import Settings
+from t_bot.dependencies import validate_requests
 from t_bot.errors import BotError
 from t_bot.manifest import Manifest
 from t_bot.ollama import Ollama
@@ -146,6 +147,8 @@ class Extensions:
                 raise BotError("Версія вже існує або не є наступною.")
             if manifest.kind != "tool":
                 await self.ollama.require_model(manifest.model)
+            pins = await self.sandbox.prepare_dependencies(manifest.dependencies)
+            manifest = manifest.model_copy(update={"dependencies": pins})
             target = self.directory(manifest)
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             with tempfile.TemporaryDirectory(dir=target.parent, prefix="staging-") as temporary:
@@ -238,6 +241,7 @@ class Extensions:
         model: str,
         user_id: int,
         dependencies: list[str] | None = None,
+        input_from: str = "",
     ) -> dict:
         self.settings.authorize(user_id)
         model = model or self.store.get("model:root", self.settings.default_model)
@@ -250,14 +254,52 @@ class Extensions:
             model=model,
             entrypoint="invoke" if kind == "tool" else "build_agent",
             example_usage=request[:2000],
-            dependencies=dependencies if dependencies is not None else [],
+            dependencies=[],
         )
-        if (
-            dependencies is not None
-            and self.settings.allowed_dependencies
-            and not set(base.dependencies) <= self.settings.allowed_dependencies
-        ):
-            raise BotError("Залежність відсутня в операторському ALLOWED_DEPENDENCIES.")
+        if dependencies is not None:
+            requests = validate_requests(dependencies)
+            pins = await self.sandbox.prepare_dependencies(requests)
+            base = base.model_copy(update={"dependencies": pins})
+        producer = self.get(input_from) if input_from else None
+        if producer is None:
+            for record in self.records():
+                if (
+                    record.manifest.kind == "tool" and record.manifest.id != extension_id
+                ) and re.search(r"\b" + re.escape(record.manifest.id) + r"\b", request):
+                    producer = record
+                    break
+        if producer is not None and producer.manifest.kind != "tool":
+            raise BotError("input_from має посилатися на інструмент, який повертає дані.")
+        input_contract = None
+        sample = None
+        if producer is not None:
+            properties = producer.manifest.output_schema.get("properties", {})
+            if "char_frequency" in properties:
+                input_contract = {
+                    "type": "object",
+                    "properties": {"char_frequency": properties["char_frequency"]},
+                    "required": ["char_frequency"],
+                    "additionalProperties": True,
+                }
+                sample = {"char_frequency": {"а": 3, "б": 2, "в": 1}}
+        producer_context = (
+            "This tool consumes the output of existing tool " + producer.manifest.id + ". "
+            "Do NOT recount the input file or import another extension's code. "
+            "Receive its result as payload. The host agent calls the producer first and then "
+            "passes its output to this tool. Producer output schema: "
+            + json.dumps(producer.manifest.output_schema)
+            + ". "
+            if producer is not None
+            else ""
+        )
+        if input_contract is not None:
+            base = base.model_copy(update={"input_schema": input_contract, "example": sample})
+            producer_context += (
+                "Use payload['char_frequency'] as the existing frequency data. "
+                "Do not read the original file. Plot letters only (character.isalpha()). "
+                "Save the chart in FILESYSTEM_ROOT and return its relative path. "
+                "For matplotlib use the Agg backend and set MPLCONFIGDIR under TMPDIR. "
+            )
         template = (
             TOOL_TEMPLATE if kind == "tool" else AGENT_TEMPLATE.replace("EXTENSION_ID", base.id)
         )
@@ -289,7 +331,7 @@ class Extensions:
             "Use TMPDIR for temporary files. Validation runs the example: "
             "keep it safe and avoid modifying existing user files. "
             "No dependencies unless explicitly needed; "
-            f"{dependency_policy}{explicit_dependencies}"
+            f"{dependency_policy}{explicit_dependencies}{producer_context}"
             f"Base manifest: {base.model_dump_json()}. Template:\n{template}\n"
             f"User request: {request}"
         )
@@ -305,8 +347,14 @@ class Extensions:
             schema["properties"]["manifest"]["properties"]["dependencies"] = {
                 "const": base.dependencies
             }
+        if input_contract is not None:
+            for key in ("input_schema", "example"):
+                schema["properties"]["manifest"]["properties"][key] = {"const": getattr(base, key)}
         try:
             generated = json.loads(await self.ollama.generate(model, prompt, schema))
+            if input_contract is not None:
+                generated["manifest"]["input_schema"] = base.input_schema
+                generated["manifest"]["example"] = base.example
             if dependencies is not None:
                 # Caller-supplied dependencies are authoritative, including an explicit empty list.
                 generated["manifest"]["dependencies"] = base.dependencies
@@ -321,6 +369,15 @@ class Extensions:
                 "source": generated["source"],
                 "validation": "passed",
                 "usage": candidate.example_usage,
+                "input_from": producer.manifest.id if producer is not None else "",
+                "pipeline": {
+                    "producer": producer.manifest.id,
+                    "consumer": candidate.id,
+                    "input_field": "char_frequency",
+                    "delivery_tool": "send_file",
+                }
+                if producer is not None and input_contract is not None
+                else None,
             }
         except (ValueError, KeyError, TypeError, ValidationError) as exc:
             raise BotError(

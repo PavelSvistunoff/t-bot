@@ -96,6 +96,8 @@ def main() -> None:
         resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
     os.environ["TMPDIR"] = str(Path(request["directory"]) / "tmp")
     os.environ["HOME"] = os.environ["TMPDIR"]
+    os.environ["MPLBACKEND"] = "Agg"
+    os.environ["MPLCONFIGDIR"] = str(Path(os.environ["TMPDIR"]) / "matplotlib")
     if request.get("filesystem_root"):
         os.environ["FILESYSTEM_ROOT"] = request["filesystem_root"]
         os.chdir(request["filesystem_root"])

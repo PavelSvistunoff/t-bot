@@ -14,7 +14,7 @@ from t_bot.runtime import Invocation, current_invocation
 @pytest.mark.sandbox
 @pytest.mark.parametrize("generated_dependencies", [None, [], ["wrong==1"]])
 async def test_explicit_dependencies_survive_generation_and_are_importable(
-    components, monkeypatch, generated_dependencies
+    components, monkeypatch, generated_dependencies, pip_report
 ):
     runtime, extensions, _, _ = components
     manifest = Manifest(
@@ -43,6 +43,8 @@ def invoke(payload: dict) -> dict:
     original = sandbox.bounded_process
 
     async def run(command, **kwargs):
+        if pip_report(command):
+            return b""
         if "install" in command:
             return await install(command, **kwargs)
         return await original(command, **kwargs)
@@ -65,7 +67,7 @@ def invoke(payload: dict) -> dict:
     }
 
 
-@pytest.mark.parametrize("dependencies", [["--target=/tmp"], ["Pillow"], ["Pillow==10.3.0"]])
+@pytest.mark.parametrize("dependencies", [["--target=/tmp"], ["Pillow>=1"], ["Pillow==10.3.0"]])
 async def test_invalid_or_disallowed_explicit_dependencies_fail_before_generation(
     components, settings, monkeypatch, dependencies
 ):

@@ -28,8 +28,8 @@ COMMAND_GUIDE = """Команди Telegram (надсилайте окремим 
 Також: «Котра година» або «Скока время»."""
 
 TOOL_EXAMPLES = {
-    "install_dependencies": "Встанови six==1.17.0 для extensions. "
-    "Укажіть усі залежності з точними версіями й додайте той самий список у маніфест.",
+    "install_dependencies": "Встанови matplotlib для extensions. "
+    "pip сам визначить повний набір залежностей; передайте результат до create_extension.",
     "send_file": "Надішли reports/report.pdf вкладенням у цей чат. "
     "Шлях відносний до FILESYSTEM_ROOT; до 50 МБ або меншого ATTACHMENT_MAX_BYTES.",
     "list_files": "Покажи файли в каталозі reports.",
@@ -70,8 +70,9 @@ def render_help(manifests: Iterable[Manifest] = ()) -> str:
         "set_model — вибрати встановлену модель для root або агента.\n"
         "restart_bot — перезапустити бота; приклад: «Перезапусти себе».\n"
         "create_extension — створити Python-інструмент, агента чи субагента з ADK. "
-        "Для сторонніх бібліотек передайте dependencies=[package==version]; "
-        "для імпорту PIL — Pillow.\n"
+        "Передайте dependencies із назвами основних бібліотек; pip визначить решту. "
+        "Для графіка з word_count використайте input_from=word_count; "
+        "передавайте його char_frequency інструменту малювання.\n"
         "Приклад: «Створи інструмент word_counter для підрахунку слів у тексті».\n"
         "Для агента вкажіть роль, модель зі /models і, для субагента, батьківський ID.\n"
         "manage_extension — активувати, вимкнути, видалити або відкотити розширення.\n"

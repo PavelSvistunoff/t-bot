@@ -45,3 +45,37 @@ async def components(settings, store):
     yield runtime, extensions, sandbox, control
     await runtime.close()
     await ollama.close()
+
+
+@pytest.fixture
+def pip_report():
+    """Write a deterministic pip dry-run report in tests that replace package downloads."""
+    import json
+
+    def write(command, packages=None):
+        if "--dry-run" not in command:
+            return False
+        index = command.index("--report")
+        if packages is None:
+            requirements = command[index + 2 :]
+            if "--constraint" in requirements:
+                requirements = requirements[2:]
+            packages = [p if "==" in p else p + "==1.0" for p in requirements]
+        Path(command[index + 1]).write_text(
+            json.dumps(
+                {
+                    "version": "1",
+                    "install": [
+                        {
+                            "metadata": {"name": p.split("==")[0], "version": p.split("==")[1]},
+                            "download_info": {"url": "https://example.org/package.whl"},
+                            "is_direct": False,
+                        }
+                        for p in packages
+                    ],
+                }
+            )
+        )
+        return True
+
+    return write

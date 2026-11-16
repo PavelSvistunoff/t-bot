@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from t_bot.config import Settings
+from t_bot.dependencies import DependencyResolver
 from t_bot.errors import BotError
 from t_bot.filesystem import BLOCKED_COMPONENTS
 from t_bot.manifest import validate_dependency_list
@@ -119,6 +120,15 @@ class Sandbox:
         self.dependencies_dir = settings.data_dir / "dependencies"
         self.dependencies_dir.mkdir(exist_ok=True, mode=0o700)
         self.provision_lock = asyncio.Lock()
+        self.resolver = DependencyResolver(settings, self._dependency_process)
+
+    async def _dependency_process(self, command: list[str], **kwargs) -> bytes:
+        return await bounded_process(command, **kwargs)
+
+    async def prepare_dependencies(self, requirements: list[str]) -> list[str]:
+        pins = await self.resolver.resolve(requirements)
+        await self.provision(pins)
+        return pins
 
     def dependency_path(self, dependencies: list[str]) -> Path:
         digest = hashlib.sha256("\n".join(sorted(dependencies)).encode()).hexdigest()[:20]
@@ -273,11 +283,7 @@ class Sandbox:
             dependencies = validate_dependency_list(dependencies)
         except ValueError as exc:
             raise BotError(str(exc)) from exc
-        if (
-            self.settings.allowed_dependencies
-            and not set(dependencies) <= self.settings.allowed_dependencies
-        ):
-            raise BotError("Залежність відсутня в операторському ALLOWED_DEPENDENCIES.")
+        self.resolver.check_allowed(dependencies)
         destination = self.dependency_path(dependencies)
         async with self.provision_lock:
             if destination.exists():
@@ -322,8 +328,7 @@ class Sandbox:
         action: str,
         payload: dict,
     ) -> dict:
-        dependencies = manifest.get("dependencies", [])
-        await self.provision(dependencies)
+        dependencies = await self.prepare_dependencies(manifest.get("dependencies", []))
         with tempfile.TemporaryDirectory(prefix="t-bot-isolated-") as temporary:
             isolated = await asyncio.to_thread(Path(temporary).resolve)
             (isolated / "tmp").mkdir()

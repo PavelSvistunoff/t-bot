@@ -9,10 +9,10 @@ from pathlib import Path
 from t_bot.config import Settings
 from t_bot.console import Console
 from t_bot.current_time import current_datetime
+from t_bot.dependencies import validate_requests
 from t_bot.errors import BotError
 from t_bot.filesystem import FileSystem
 from t_bot.help_guide import render_help
-from t_bot.manifest import validate_dependency_list
 from t_bot.sqlite_tools import SQLiteTools
 from t_bot.web_search import WebSearch
 
@@ -26,7 +26,7 @@ class BasicTools:
         screenshot_sender: Callable[[], Awaitable[dict]] | None = None,
         help_provider: Callable[[], str] = render_help,
         file_sender: Callable[[str, bytes], Awaitable[dict]] | None = None,
-        dependency_installer: Callable[[list[str]], Awaitable[None]] | None = None,
+        dependency_installer: Callable[[list[str]], Awaitable[list[str]]] | None = None,
     ):
         self.dependency_installer = dependency_installer
         self.file_sender = file_sender
@@ -84,9 +84,10 @@ class BasicTools:
     async def install_dependencies(self, dependencies: list[str]) -> dict:
         """Install a complete dependency set for extensions, without changing the bot environment.
 
-        Supply up to 10 exact package==version entries, including transitive dependencies.
+        Supply package names or package==version. pip resolves and pins transitive dependencies.
         Only wheels are allowed. Empty ALLOWED_DEPENDENCIES allows all pinned packages;
-        otherwise every entry must be allowlisted. Repeated calls reuse the installed set.
+        otherwise every resolved package must be allowlisted.
+        Repeated calls reuse the installed set.
         To use it, put this same complete list in the extension manifest's dependencies;
         this tool does not edit existing extensions. No shell options, URLs or local paths.
         """
@@ -94,11 +95,11 @@ class BasicTools:
         if self.dependency_installer is None:
             return {"error": "Інсталятор залежностей extensions не підключено."}
         try:
-            packages = validate_dependency_list(dependencies)
+            packages = validate_requests(dependencies)
             if not packages:
-                raise BotError("Укажіть хоча б одну бібліотеку у форматі package==version.")
+                raise BotError("Укажіть хоча б одну назву бібліотеки або package==version.")
             self.audit(user_id, "dependencies.install", ", ".join(packages))
-            await self.dependency_installer(packages)
+            packages = await self.dependency_installer(packages)
         except (BotError, ValueError) as exc:
             return {"error": str(exc)}
         except TimeoutError:

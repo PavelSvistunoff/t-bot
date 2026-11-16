@@ -8,9 +8,9 @@ from t_bot.tool_names import BASIC_TOOL_DESCRIPTIONS
 
 
 def validate_dependency_list(values: list[str]) -> list[str]:
-    """Accept at most ten pinned packages, without pip options, URLs or local paths."""
-    if len(values) > 10:
-        raise ValueError("At most 10 dependencies are allowed")
+    """Accept at most 64 pinned packages, without pip options, URLs or local paths."""
+    if len(values) > 64:
+        raise ValueError("At most 64 dependencies are allowed")
     for value in values:
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*==[a-zA-Z0-9_.+!-]+", value):
             raise ValueError("Dependencies must use package==version without URLs or options")
@@ -27,7 +27,7 @@ class Manifest(BaseModel):
     entrypoint: str = "invoke"
     model: str = "gemma4:12b"
     parent: str = "root"
-    dependencies: list[str] = Field(default_factory=list, max_length=10)
+    dependencies: list[str] = Field(default_factory=list, max_length=64)
     permissions: list[Literal["workspace"]] = Field(default=["workspace"])
     input_schema: dict = Field(
         default_factory=lambda: {

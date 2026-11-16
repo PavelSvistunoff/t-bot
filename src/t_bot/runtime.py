@@ -29,6 +29,7 @@ from t_bot.extensions import ExtensionRecord, Extensions
 from t_bot.help_guide import render_help
 from t_bot.ollama import Ollama
 from t_bot.store import Store
+from t_bot.task_progress import TaskProgress
 from t_bot.tool_names import BASIC_TOOL_DESCRIPTIONS
 
 logger = logging.getLogger(__name__)
@@ -100,7 +101,7 @@ class AgentRuntime:
             self.send_screenshot,
             help_provider=lambda: render_help(r.manifest for r in extensions.records()),
             file_sender=self.send_file,
-            dependency_installer=extensions.sandbox.provision,
+            dependency_installer=extensions.sandbox.prepare_dependencies,
         )
         self.sessions = DatabaseSessionService(
             db_url=f"sqlite+aiosqlite:///{settings.data_dir / 'sessions.sqlite3'}",
@@ -230,15 +231,18 @@ class AgentRuntime:
         parent: str = "root",
         model: str = "",
         dependencies: list[str] | None = None,
+        input_from: str = "",
     ) -> dict:
         """Create and activate Python ADK agent/subagent or tool from a request.
 
         kind: tool, agent, subagent. extension_id: unique lowercase Python identifier.
         parent: root or active parent agent ID. model: installed Ollama model or empty for default.
-        dependencies: complete pinned package==version list, including transitive dependencies.
+        dependencies: main package names or package==version; pip resolves transitive dependencies.
         Pass the exact list returned by install_dependencies (e.g. Pillow==10.3.0 for PIL).
         An explicit list is applied by host code; [] forbids added dependencies. If omitted,
         the generator chooses and declares required packages. Installation happens automatically.
+        input_from: existing producer tool ID, e.g. word_count; consume its output instead of
+        recounting a file. For word_count plots the input is char_frequency, not file_path.
         Existing ID creates a new version; failed validation leaves the previous version active.
         """
         invocation = self.authorize_tool()
@@ -251,6 +255,7 @@ class AgentRuntime:
                 model,
                 invocation.user_id,
                 dependencies=dependencies,
+                input_from=input_from,
             )
             result.pop("source", None)
             result["source_command"] = f"/source {extension_id}"
@@ -326,7 +331,11 @@ class AgentRuntime:
                 "Для встановлення Python-бібліотек розширень використовуй install_dependencies; "
                 "передай повний список package==version у параметр dependencies "
                 "виклику create_extension. "
-                "Для PIL потрібен пакет Pillow; install_dependencies сам не змінює маніфест. "
+                "pip сам визначає транзитивні залежності: передавай основні назви, не вгадуй "
+                "numpy/kiwisolver та їхні версії. Для PIL потрібен пакет Pillow. "
+                "Якщо новий інструмент має використати word_count, передай input_from='word_count' "
+                "до create_extension. Для виконання спочатку виклич word_count, потім передай "
+                "його char_frequency інструменту малювання і надішли файл через send_file. "
                 "ModuleNotFoundError означає проблему імпорту або залежностей; "
                 "не стверджуй, що графіка заблокована sandbox без доказів. "
                 "Для надсилання файлу вкладенням у поточний чат використовуй send_file. "
@@ -389,6 +398,7 @@ class AgentRuntime:
                 app_name=APP_NAME, agent=self.build_agent(), session_service=self.sessions
             )
             answer = []
+            progress = TaskProgress()
             async with asyncio.timeout(self.settings.task_timeout_seconds):
                 async for event in runner.run_async(
                     user_id=str(user_id),
@@ -396,14 +406,17 @@ class AgentRuntime:
                     new_message=types.Content(role="user", parts=[types.Part(text=text)]),
                     run_config=RunConfig(max_llm_calls=self.settings.max_llm_calls),
                 ):
+                    progress.observe(event)
                     if event.is_final_response() and event.content:
-                        answer = [
+                        final_parts = [
                             part.text
                             for part in event.content.parts or []
-                            if part.text and not part.thought
+                            if part.text and part.text.strip() and not part.thought
                         ]
+                        if final_parts:
+                            answer = final_parts
             if not answer:
-                raise BotError("Модель не повернула текстову відповідь. Спробуйте іншу модель.")
+                return progress.missing_answer()
             return "\n".join(answer)
         finally:
             current_invocation.reset(token)
