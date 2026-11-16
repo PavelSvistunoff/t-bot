@@ -237,6 +237,7 @@ class Extensions:
         parent: str,
         model: str,
         user_id: int,
+        dependencies: list[str] | None = None,
     ) -> dict:
         self.settings.authorize(user_id)
         model = model or self.store.get("model:root", self.settings.default_model)
@@ -249,7 +250,14 @@ class Extensions:
             model=model,
             entrypoint="invoke" if kind == "tool" else "build_agent",
             example_usage=request[:2000],
+            dependencies=dependencies if dependencies is not None else [],
         )
+        if (
+            dependencies is not None
+            and self.settings.allowed_dependencies
+            and not set(base.dependencies) <= self.settings.allowed_dependencies
+        ):
+            raise BotError("Залежність відсутня в операторському ALLOWED_DEPENDENCIES.")
         template = (
             TOOL_TEMPLATE if kind == "tool" else AGENT_TEMPLATE.replace("EXTENSION_ID", base.id)
         )
@@ -257,6 +265,12 @@ class Extensions:
             f"Allowed pinned packages: {sorted(self.settings.allowed_dependencies)}. "
             if self.settings.allowed_dependencies
             else "Any package is allowed; pin every dependency as package==version. "
+        )
+        explicit_dependencies = (
+            f"Required dependencies are fixed by the caller: {base.dependencies}. "
+            "Do not remove, replace or add packages; use these libraries in the source. "
+            if dependencies is not None
+            else "Declare every third-party import in manifest.dependencies with exact versions. "
         )
         prompt = (
             "Generate a Python extension. Return ONE JSON object with keys source and manifest. "
@@ -275,7 +289,7 @@ class Extensions:
             "Use TMPDIR for temporary files. Validation runs the example: "
             "keep it safe and avoid modifying existing user files. "
             "No dependencies unless explicitly needed; "
-            f"{dependency_policy}"
+            f"{dependency_policy}{explicit_dependencies}"
             f"Base manifest: {base.model_dump_json()}. Template:\n{template}\n"
             f"User request: {request}"
         )
@@ -287,8 +301,15 @@ class Extensions:
         }
         for field in ("id", "kind", "version", "parent", "model", "entrypoint"):
             schema["properties"]["manifest"]["properties"][field] = {"const": getattr(base, field)}
+        if dependencies is not None:
+            schema["properties"]["manifest"]["properties"]["dependencies"] = {
+                "const": base.dependencies
+            }
         try:
             generated = json.loads(await self.ollama.generate(model, prompt, schema))
+            if dependencies is not None:
+                # Caller-supplied dependencies are authoritative, including an explicit empty list.
+                generated["manifest"]["dependencies"] = base.dependencies
             candidate = Manifest.model_validate(generated["manifest"])
             fixed = ("id", "kind", "version", "parent", "model", "entrypoint")
             if any(getattr(candidate, field) != getattr(base, field) for field in fixed):

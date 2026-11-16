@@ -108,7 +108,9 @@ class BasicTools:
         return {
             "status": "installed",
             "dependencies": packages,
-            "usage": "Додайте цей повний список до dependencies маніфесту розширення. "
+            "create_extension_arguments": {"dependencies": packages},
+            "usage": "Передайте цей повний список у параметр dependencies "
+            "інструмента create_extension. "
             "Для наявного розширення створіть нову версію; поточний маніфест не змінено.",
         }
 

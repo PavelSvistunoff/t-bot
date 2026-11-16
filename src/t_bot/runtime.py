@@ -229,11 +229,16 @@ class AgentRuntime:
         extension_id: str,
         parent: str = "root",
         model: str = "",
+        dependencies: list[str] | None = None,
     ) -> dict:
         """Create and activate Python ADK agent/subagent or tool from a request.
 
         kind: tool, agent, subagent. extension_id: unique lowercase Python identifier.
         parent: root or active parent agent ID. model: installed Ollama model or empty for default.
+        dependencies: complete pinned package==version list, including transitive dependencies.
+        Pass the exact list returned by install_dependencies (e.g. Pillow==10.3.0 for PIL).
+        An explicit list is applied by host code; [] forbids added dependencies. If omitted,
+        the generator chooses and declares required packages. Installation happens automatically.
         Existing ID creates a new version; failed validation leaves the previous version active.
         """
         invocation = self.authorize_tool()
@@ -245,6 +250,7 @@ class AgentRuntime:
                 parent,
                 model,
                 invocation.user_id,
+                dependencies=dependencies,
             )
             result.pop("source", None)
             result["source_command"] = f"/source {extension_id}"
@@ -318,7 +324,11 @@ class AgentRuntime:
                 "Делегуй спеціалізованим агентам через доступні інструменти агентів. "
                 "Не виконуй перезапуск без прохання користувача. Не передавай секрети у код. "
                 "Для встановлення Python-бібліотек розширень використовуй install_dependencies; "
-                "передай повний список package==version і збережи його в маніфесті розширення. "
+                "передай повний список package==version у параметр dependencies "
+                "виклику create_extension. "
+                "Для PIL потрібен пакет Pillow; install_dependencies сам не змінює маніфест. "
+                "ModuleNotFoundError означає проблему імпорту або залежностей; "
+                "не стверджуй, що графіка заблокована sandbox без доказів. "
                 "Для надсилання файлу вкладенням у поточний чат використовуй send_file. "
                 "Викликай лише на прохання користувача; не вигадуй успішне надсилання. "
                 "Для файлів використовуй list_files, read_file, write_file, create_directory, "
