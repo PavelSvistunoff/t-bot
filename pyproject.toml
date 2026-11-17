@@ -21,7 +21,13 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "mypy>=1.18,<2"]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=1,<2",
+    "ruff>=0.12,<1",
+    "mypy>=1.18,<2",
+    "sympy==1.13.0",
+]
 
 [project.scripts]
 t-bot = "t_bot.cli:main"

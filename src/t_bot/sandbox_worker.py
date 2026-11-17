@@ -114,9 +114,91 @@ def run_tests(directory: str) -> dict:
     }
 
 
+def symbolic_references(expressions: list[str]) -> dict:
+    """Evaluate only a bounded math AST with exact SymPy constants, never sympify/eval strings."""
+    import ast
+    import math
+
+    import sympy
+
+    functions = {name: getattr(sympy, name) for name in ("sin", "cos", "tan", "log", "sqrt", "exp")}
+    functions["abs"] = sympy.Abs
+
+    def evaluate(node):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int | float)
+            and not isinstance(node.value, bool)
+        ):
+            if not math.isfinite(node.value) or abs(node.value) > 10**100:
+                raise ValueError("Constant exceeds budget")
+            return (
+                sympy.Integer(node.value)
+                if type(node.value) is int
+                else sympy.Float(str(node.value))
+            )
+        if isinstance(node, ast.Name) and node.id in {"pi", "e"}:
+            return sympy.pi if node.id == "pi" else sympy.E
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd | ast.USub):
+            return evaluate(node.operand) * (-1 if isinstance(node.op, ast.USub) else 1)
+        if isinstance(node, ast.BinOp):
+            left, right = evaluate(node.left), evaluate(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Pow):
+                if right.is_real is not True or abs(float(right)) > 1000:
+                    raise ValueError("Exponent exceeds budget")
+                if (
+                    left.is_Integer
+                    and right.is_positive
+                    and int(abs(left)).bit_length() * float(right) > 4096
+                ):
+                    raise ValueError("Power exceeds budget")
+                return left**right
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in functions and not node.keywords and 1 <= len(node.args) <= 2:
+                arguments = [evaluate(arg) for arg in node.args]
+                if any(arg.is_real is not True or abs(float(arg)) > 1000 for arg in arguments):
+                    raise ValueError("Function argument exceeds budget")
+                return functions[node.func.id](*arguments)
+        raise ValueError("Unsupported expression")
+
+    if not isinstance(expressions, list) or len(expressions) > 128:
+        raise ValueError("At most 128 reference expressions")
+    results: dict[str, dict] = {}
+    for expression in expressions:
+        try:
+            if not isinstance(expression, str) or not 1 <= len(expression) <= 512:
+                raise ValueError("Expression exceeds budget")
+            tree = ast.parse(expression, mode="eval")
+            if sum(1 for _ in ast.walk(tree)) > 128:
+                raise ValueError("Expression exceeds budget")
+            result = evaluate(tree.body)
+            if result.is_real is not True or result.is_finite is not True:
+                results[expression] = {"status": "domain_error"}
+                continue
+            value = int(result) if result.is_Integer else float(result.evalf(17))
+            results[expression] = (
+                {"status": "number", "value": value}
+                if math.isfinite(value)
+                else {"status": "domain_error"}
+            )
+        except (SyntaxError, ValueError, TypeError, ArithmeticError, RecursionError):
+            results[expression] = {"status": "unknown"}
+    return {"semantics": "sympy", "values": results}
+
+
 async def run(request: dict) -> dict:
     if request["action"] == "probe":
         return {"ready": True}
+    if request["action"] == "reference":
+        return symbolic_references(request["payload"]["expressions"])
     manifest = request["manifest"]
     module = load_module(request["directory"])
     if request["action"] == "test":

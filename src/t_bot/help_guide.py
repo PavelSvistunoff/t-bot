@@ -39,6 +39,7 @@ TOOL_EXAMPLES = {
     "write_file": "Запиши текст «Привіт» у notes.txt. Наявний вміст буде замінено.",
     "create_directory": "Створи каталог reports/2026.",
     "delete_file": "Видали reports/old.txt. Файл буде видалено з диска.",
+    "read_webpage": "Прочитай https://docs.python.org/3/library/sqlite3.html і підсумуй основне.",
     "search_web": "Знайди в інтернеті документацію Python sqlite3, дай 5 посилань.",
     "list_databases": "Покажи доступні SQLite-бази та їхні ідентифікатори.",
     "create_database": "Створи SQLite-базу notes.",

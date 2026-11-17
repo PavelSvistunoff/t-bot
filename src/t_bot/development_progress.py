@@ -21,7 +21,7 @@ PHASES = {
     "qa_expectations": "Незалежна перевірка очікувань QA",
     "pm_final": "PM затверджує фінальне технічне завдання",
     "developer": "Developer пише або доопрацьовує код",
-    "validation": "Перевірка реалізації в sandbox",
+    "validation": "Перевірка коду й успішного прикладу в sandbox",
     "qa_write": "QA пише тести happy / failure / edge cases",
     "qa_execute": "Виконання QA-тестів у sandbox",
     "qa_triage": "QA аналізує результати тестів",

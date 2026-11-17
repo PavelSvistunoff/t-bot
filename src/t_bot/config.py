@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     sqlite_database_dir: Path | None = None
     sqlite_query_timeout_seconds: PositiveInt = 5
     sqlite_max_rows: Annotated[int, Field(ge=1, le=1000)] = 100
+    webpage_timeout_seconds: PositiveInt = 15
+    webpage_max_bytes: Annotated[int, Field(ge=1024, le=5_242_880)] = 1_048_576
+    webpage_max_chars: Annotated[int, Field(ge=256, le=48_000)] = 20_000
     web_search_timeout_seconds: PositiveInt = 15
     web_search_max_results: Annotated[int, Field(ge=1, le=10)] = 10
     console_timeout_seconds: PositiveInt = 30
@@ -46,6 +49,7 @@ class Settings(BaseSettings):
     extension_team_stage_attempts: PositiveInt = 2
     extension_team_max_calls: PositiveInt = 24
     extension_team_stagnation_limit: PositiveInt = 3
+    extension_team_no_progress_limit: PositiveInt = 6
     extension_team_fallback_models: list[str] = Field(default_factory=list)
     max_delegation_depth: PositiveInt = 3
     max_context_chars: Annotated[int, Field(ge=4000)] = 48000

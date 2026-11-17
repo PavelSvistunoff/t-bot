@@ -353,7 +353,7 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix="t-bot-isolated-") as temporary:
             isolated = await asyncio.to_thread(Path(temporary).resolve)
             (isolated / "tmp").mkdir()
-            if action == "test":
+            if action in {"test", "reference"}:
                 root = isolated / "qa_workspace"
                 root.mkdir()
             else:
@@ -381,7 +381,7 @@ class Sandbox:
                         self.command,
                         isolated,
                         self.dependency_path(dependencies),
-                        test_workspace=root if action == "test" else None,
+                        test_workspace=root if action in {"test", "reference"} else None,
                     ),
                     input_data=data,
                     timeout_seconds=self.settings.sandbox_timeout_seconds,

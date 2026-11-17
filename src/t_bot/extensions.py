@@ -13,6 +13,7 @@ from uuid import uuid4
 import jsonschema
 from pydantic import BaseModel, Field
 
+from t_bot.candidate_validation import verify_smoke_result
 from t_bot.config import Settings
 from t_bot.dependencies import validate_requests
 from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
@@ -20,6 +21,7 @@ from t_bot.errors import BotError
 from t_bot.extension_team import ExtensionTeam, TeamFailure
 from t_bot.manifest import Manifest
 from t_bot.ollama import Ollama
+from t_bot.qa_expectations import math_expressions, math_semantics
 from t_bot.sandbox import Sandbox
 from t_bot.store import Store
 
@@ -405,7 +407,10 @@ class Extensions:
             "Use TMPDIR for temporary files. Validation runs the example: "
             "keep it safe and avoid modifying existing user files. "
             "Standard-library modules (math, json, typing, sys, pathlib) are already built in; "
-            "never add them to pip dependencies. No dependencies unless explicitly needed; "
+            "never add them to pip dependencies. For SymPy use is_real/is_finite; "
+            "Float has no is_nan attribute. Parse untrusted expressions via whitelisted AST "
+            "constructors, not sympify/parse_expr on arbitrary strings. "
+            "No dependencies unless explicitly needed; "
             f"{dependency_policy}{explicit_dependencies}{producer_context}"
             f"Base manifest: {base.model_dump_json()}. Template:\n{template}\n"
             f"User request: {request}"
@@ -430,6 +435,19 @@ class Extensions:
             for key in ("input_schema", "example"):
                 schema["properties"]["manifest"]["properties"][key] = {"const": getattr(base, key)}
 
+        async def reference_values(generated: dict, tests: str, spec: dict) -> dict:
+            manifest = generated["manifest"]
+            semantics = math_semantics(request, manifest)
+            if semantics != "sympy":
+                return {"semantics": semantics, "values": {}}
+            expressions = math_expressions(tests, spec, manifest.get("example", {}))
+            return await self.sandbox.execute(
+                None,
+                manifest,
+                "reference",
+                {"expressions": expressions},
+            )
+
         async def validate_candidate(generated: dict) -> dict:
             if permissions is not None:
                 generated["manifest"]["permissions"] = base.permissions
@@ -444,8 +462,14 @@ class Extensions:
             if any(getattr(candidate, field) != getattr(base, field) for field in fixed):
                 raise BotError("Генератор змінив обов’язкові поля маніфесту.")
             with tempfile.TemporaryDirectory(prefix="team-validate-") as temporary:
-                await self.validate_source(candidate, generated["source"], Path(temporary))
-            return {"manifest": candidate.model_dump(), "source": generated["source"]}
+                result = await self.validate_source(candidate, generated["source"], Path(temporary))
+            validated = {"manifest": candidate.model_dump(), "source": generated["source"]}
+            if candidate.kind == "tool":
+                oracle = await reference_values(validated, "", {})
+                validated["smoke_result"] = verify_smoke_result(
+                    request, candidate.model_dump(), result, oracle
+                )
+            return validated
 
         async def execute_tests(generated: dict, tests: str) -> dict:
             candidate = Manifest.model_validate(generated["manifest"])
@@ -478,6 +502,7 @@ class Extensions:
             developer_schema=schema,
             validate=validate_candidate,
             execute_tests=execute_tests,
+            reference_values=reference_values,
             progress=progress,
         )
         generated = build["candidate"]

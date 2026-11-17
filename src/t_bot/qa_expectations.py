@@ -96,16 +96,64 @@ def python_math_task(request: str) -> bool:
     )
 
 
-def audit_specification(request: str, spec: dict) -> dict:
+def math_semantics(request: str, manifest: dict | None = None) -> str:
+    if manifest is not None:
+        return (
+            "sympy"
+            if any(
+                dependency.split("==", 1)[0].casefold() == "sympy"
+                for dependency in manifest.get("dependencies", [])
+            )
+            else "math"
+        )
+    return "sympy" if "sympy" in request.casefold() else "math"
+
+
+def math_expressions(tests: str, spec: dict, example: dict) -> list[str]:
+    expressions = [value for value in example.values() if isinstance(value, str)]
+    for cases in spec.values():
+        if isinstance(cases, list):
+            for case in cases:
+                expressions.extend(re.findall(r"['\"`]([^'\"`]+)['\"`]", case))
+    if tests:
+        for node in ast.walk(ast.parse(tests)):
+            if isinstance(node, ast.Dict):
+                for key, value in zip(node.keys, node.values, strict=True):
+                    if isinstance(key, ast.Constant) and key.value in {
+                        "expression",
+                        "expr",
+                        "text",
+                    }:
+                        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                            expressions.append(value.value)
+    return list(dict.fromkeys(value for value in expressions if 0 < len(value) <= 512))[:128]
+
+
+def reference_value(expression: str, semantics: str, references: dict | None = None):
+    if semantics == "sympy":
+        # Never substitute binary-float math for a symbolic domain check (e.g. tan(pi/2)).
+        result = (references or {}).get(expression, {})
+        return result.get("value") if result.get("status") == "number" else None
+    return reference_math(expression)
+
+
+def audit_specification(
+    request: str,
+    spec: dict,
+    *,
+    semantics: str | None = None,
+    references: dict | None = None,
+) -> dict:
     """Locate independently verifiable contradictions before implementation or QA."""
     findings = []
     corrections = []
+    semantics = semantics or math_semantics(request)
     if python_math_task(request):
         for section in ("requirements", "acceptance_criteria", "happy_path", "failure_path"):
             for index, case in enumerate(spec.get(section, [])):
                 for match in re.finditer(r"['\"`]([^'\"`]+)['\"`]", case):
                     expression = match.group(1)
-                    value = reference_math(expression)
+                    value = reference_value(expression, semantics, references)
                     if value is None:
                         continue
                     location = f"{section}[{index}]"
@@ -273,13 +321,21 @@ def _numeric_agreement(
     return round(abs(expected - reference), places) == 0
 
 
-def audit_tests(request: str, spec: dict, tests: str) -> dict:
+def audit_tests(
+    request: str,
+    spec: dict,
+    tests: str,
+    *,
+    semantics: str | None = None,
+    references: dict | None = None,
+) -> dict:
     """Check directly analyzable unittest assertions; unknown forms still require review."""
-    specification = audit_specification(request, spec)
+    semantics = semantics or math_semantics(request)
+    specification = audit_specification(request, spec, semantics=semantics, references=references)
     if not specification["passed"]:
         return specification
     findings = []
-    references = []
+    reference_checks = []
     target = "qa"
     tree = ast.parse(tests)
     imported_modules, imported_functions = _math_imports(tree)
@@ -338,14 +394,14 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                     and isinstance(actual, str)
                     and python_math_task(request)
                 ):
-                    reference = reference_math(actual)
+                    reference = reference_value(actual, semantics, references)
                     agreement = (
                         _numeric_agreement(call, expected, reference, values)
                         if reference is not None
                         else None
                     )
                     if reference is not None:
-                        references.append(
+                        reference_checks.append(
                             {
                                 "test": method.name,
                                 "expression": actual,
@@ -353,6 +409,14 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                                 "reference": reference,
                                 "matched": agreement,
                             }
+                        )
+                    if (
+                        semantics == "sympy"
+                        and (references or {}).get(actual, {}).get("status") == "domain_error"
+                    ):
+                        findings.append(
+                            f"{method.name}: {actual!r} не має скінченного дійсного результату "
+                            "за семантикою SymPy; очікування числа помилкове."
                         )
                     if agreement is False:
                         if actual in json_text(spec) and str(expected) in json_text(spec):
@@ -382,7 +446,7 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                     )
                     and isinstance(actual, str)
                     and python_math_task(request)
-                    and reference_math(actual) is not None
+                    and reference_value(actual, semantics, references) is not None
                 ):
                     findings.append(
                         f"{method.name}: для валідного {actual!r} помилково очікується помилка."
@@ -391,8 +455,9 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
         "passed": not findings,
         "target": target,
         "findings": list(dict.fromkeys(findings)),
-        "reference_checks": references,
-        "scope": "Bounded Python-math/literal checks; other oracles need independent review.",
+        "reference_checks": reference_checks,
+        "semantics": semantics,
+        "scope": "Bounded AST/reference checks; unknown oracles need independent review.",
     }
 
 
@@ -473,3 +538,22 @@ class StagnationGuard:
             "basis": "artifacts" if state is not None else "error",
             "state": state,
         }
+
+
+class NoProgressGuard:
+    """Bound failed rounds across different artifacts; only a new milestone resets the counter."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.best_milestone = -1
+        self.failed_rounds = 0
+
+    def observe(self, milestone: int) -> dict | None:
+        if milestone > self.best_milestone:
+            self.best_milestone = milestone
+            self.failed_rounds = 0
+        else:
+            self.failed_rounds += 1
+        if self.failed_rounds < self.limit:
+            return None
+        return {"failed_rounds": self.failed_rounds, "milestone": self.best_milestone}

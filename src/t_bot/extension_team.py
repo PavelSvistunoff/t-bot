@@ -15,6 +15,7 @@ from t_bot.development_progress import DevelopmentEvent, ProgressCallback, Progr
 from t_bot.errors import BotError
 from t_bot.ollama import Ollama
 from t_bot.qa_expectations import (
+    NoProgressGuard,
     StagnationGuard,
     artifact_fingerprint,
     audit_specification,
@@ -205,6 +206,7 @@ class ExtensionTeam:
         validate: Callable[[dict], Awaitable[dict]],
         execute_tests: Callable[[dict, str], Awaitable[dict]],
         progress: ProgressCallback | None = None,
+        reference_values: Callable[[dict, str, dict], Awaitable[dict]] | None = None,
     ) -> dict:
         self.settings.authorize(user_id)
         report: dict = {
@@ -315,6 +317,15 @@ class ExtensionTeam:
             raise BotError(f"{role}: усі спроби завершилися помилкою. {errors[-1]}")
 
         guard = StagnationGuard(self.settings.extension_team_stagnation_limit)
+        progress_guard = NoProgressGuard(self.settings.extension_team_no_progress_limit)
+        milestone = 0
+
+        async def advance_progress(level: int, stage: str) -> None:
+            nonlocal milestone
+            if level > milestone:
+                milestone = level
+                report["progress"] = {"milestone": level, "stage": stage}
+                await record("Milestone", report["progress"])
 
         async def checked_route(
             evidence: dict,
@@ -324,6 +335,14 @@ class ExtensionTeam:
             tests: str = "",
             phase: str = "",
         ) -> str:
+            stalled = progress_guard.observe(milestone)
+            if stalled is not None:
+                await record("NoProgress", stalled)
+                raise BotError(
+                    "Немає прогресу між версіями коду та тестів: "
+                    f"{stalled['failed_rounds']} раундів без нового контрольного етапу. "
+                    "Усі спроби та останній валідний кандидат (якщо він є) збережено."
+                )
             state = (
                 {"phase": phase, **artifact_fingerprint(candidate, tests)}
                 if candidate is not None
@@ -345,7 +364,18 @@ class ExtensionTeam:
             return escalation["target"]
 
         async def check_specification(specification: dict) -> None:
-            audit = audit_specification(request, specification)
+            current_candidate = report.get("last_valid_candidate")
+            oracle = (
+                await reference_values(current_candidate, "", specification)
+                if reference_values is not None and current_candidate
+                else {}
+            )
+            audit = audit_specification(
+                request,
+                specification,
+                semantics=oracle.get("semantics"),
+                references=oracle.get("values"),
+            )
             await record("SpecificationAudit", audit)
             if not audit["passed"]:
                 raise BotError(
@@ -478,7 +508,14 @@ class ExtensionTeam:
                             report["last_valid_candidate"] = last_valid
                             report["candidate"] = copy.deepcopy(candidate)
                             await self.save(report)
-                            await record("Validation", {"passed": True})
+                            await record(
+                                "Validation",
+                                {
+                                    "passed": True,
+                                    "smoke_result": candidate.get("smoke_result"),
+                                },
+                            )
+                            await advance_progress(1, "candidate_validated")
                             reporter.emit(DevelopmentEvent("validation", "completed", report["id"]))
                         except (BotError, ValueError, OSError) as exc:
                             candidate = copy.deepcopy(last_valid)
@@ -521,7 +558,18 @@ class ExtensionTeam:
                     report["candidate"] = candidate
                     report["tests"] = tests
                     await self.save(report)
-                    expectations = audit_tests(request, final_spec, tests)
+                    oracle = (
+                        await reference_values(candidate, tests, final_spec)
+                        if reference_values is not None
+                        else {}
+                    )
+                    expectations = audit_tests(
+                        request,
+                        final_spec,
+                        tests,
+                        semantics=oracle.get("semantics"),
+                        references=oracle.get("values"),
+                    )
                     await record("QAExpectations", expectations)
                     if not expectations["passed"]:
                         feedback = {"expectations": expectations}
@@ -546,6 +594,7 @@ class ExtensionTeam:
                             )
                         )
                         continue
+                    await advance_progress(2, "expectations_audit_passed")
                     test_review = await ask(
                         "Reviewer",
                         json.dumps(
@@ -592,9 +641,14 @@ class ExtensionTeam:
                             )
                         )
                         continue
+                    await advance_progress(3, "test_review_approved")
                     reporter.emit(DevelopmentEvent("qa_execute", "started", report["id"]))
                     execution = await execute_tests(candidate, tests)
                     await record("QAExecution", execution)
+                    if execution.get("tests_run", 0) > 0:
+                        await advance_progress(4, "tests_executed")
+                    if execution.get("passed"):
+                        await advance_progress(5, "tests_passed")
                     reporter.emit(
                         DevelopmentEvent(
                             "qa_execute",
