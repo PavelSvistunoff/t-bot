@@ -14,7 +14,8 @@ from pathlib import Path
 from t_bot.config import Settings
 from t_bot.dependencies import DependencyResolver
 from t_bot.errors import BotError
-from t_bot.filesystem import BLOCKED_COMPONENTS
+from t_bot.filesystem import BLOCKED_COMPONENTS, FileSystem
+from t_bot.image_quality import IMAGE_SUFFIXES
 from t_bot.manifest import validate_dependency_list
 
 MAX_OUTPUT_BYTES = 128_000
@@ -353,7 +354,7 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix="t-bot-isolated-") as temporary:
             isolated = await asyncio.to_thread(Path(temporary).resolve)
             (isolated / "tmp").mkdir()
-            if action in {"test", "reference"}:
+            if action in {"test", "reference", "image_probe"}:
                 root = isolated / "qa_workspace"
                 root.mkdir()
             else:
@@ -381,7 +382,9 @@ class Sandbox:
                         self.command,
                         isolated,
                         self.dependency_path(dependencies),
-                        test_workspace=root if action in {"test", "reference"} else None,
+                        test_workspace=root
+                        if action in {"test", "reference", "image_probe"}
+                        else None,
                     ),
                     input_data=data,
                     timeout_seconds=self.settings.sandbox_timeout_seconds,
@@ -391,6 +394,23 @@ class Sandbox:
                 result = json.loads(output)
                 if not isinstance(result, dict):
                     raise BotError("Розширення має повертати JSON-об’єкт.")
+                if action in {"validate", "invoke"} and manifest.get("kind") == "tool":
+                    for key in ("file_path", "image_path", "path"):
+                        path = result.get(key)
+                        if isinstance(path, str) and Path(path).suffix.casefold() in IMAGE_SUFFIXES:
+                            filesystem = FileSystem(root, self.settings.attachment_max_bytes, ())
+                            try:
+                                await asyncio.to_thread(
+                                    filesystem.read_attachment,
+                                    path,
+                                    self.settings.attachment_max_bytes,
+                                )
+                            except (BotError, OSError) as exc:
+                                raise BotError(
+                                    "Зображення має бути у FILESYSTEM_ROOT "
+                                    "і доступне після sandbox; "
+                                    "TMPDIR призначений лише для тимчасових файлів. " + str(exc)
+                                ) from exc
                 return result
             except (ValueError, TimeoutError) as exc:
                 raise BotError(

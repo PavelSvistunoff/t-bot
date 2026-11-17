@@ -194,13 +194,94 @@ def symbolic_references(expressions: list[str]) -> dict:
     return {"semantics": "sympy", "values": results}
 
 
+def inspect_image(path: str) -> dict:
+    """Decode pixels in the isolated worker; never trust the extension's file metadata."""
+    import hashlib
+    import stat
+
+    from PIL import Image, ImageChops
+
+    root = Path(os.environ["FILESYSTEM_ROOT"]).resolve()
+    file = Path(path)
+    file = (file if file.is_absolute() else root / file).resolve()
+    if not file.is_relative_to(root):
+        raise ValueError("Image must be saved inside FILESYSTEM_ROOT, not TMPDIR")
+    info = file.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > 8 * 1024 * 1024:
+        raise ValueError("Image must be a bounded regular file")
+    Image.MAX_IMAGE_PIXELS = 4_000_000
+    with Image.open(file) as original:
+        if original.width * original.height > 4_000_000:
+            raise ValueError("Image exceeds pixel budget")
+        format_name = original.format
+        original.verify()
+    with Image.open(file) as original:
+        rgba = original.convert("RGBA")
+        image = Image.alpha_composite(Image.new("RGBA", rgba.size, "white"), rgba).convert("RGB")
+        image.load()
+    background = Image.new("RGB", image.size, image.getpixel((0, 0)))
+    bounds = ImageChops.difference(image, background).getbbox()
+    return {
+        "canvas_size": list(image.size),
+        "format": format_name,
+        "nonblank": bounds is not None,
+        "content_bbox": list(bounds) if bounds else None,
+        "pixel_digest": hashlib.sha256(image.tobytes()).hexdigest(),
+    }
+
+
+async def probe_images(module, manifest: dict) -> dict:
+    """Sample controlled draws in disposable workspace and compare actual decoded pixels."""
+    import random
+
+    state = random.getstate()
+    samples = []
+    paths = set()
+    try:
+        for seed in (11, 29, 47):
+            random.seed(seed)
+            result = getattr(module, manifest["entrypoint"])(dict(manifest["example"]))
+            if inspect.isawaitable(result):
+                result = await result
+            path = next(
+                (result[key] for key in ("file_path", "image_path", "path") if key in result), None
+            )
+            if not isinstance(path, str) or result.get("error") or result.get("status") == "error":
+                raise ValueError("Generator did not return a successful image path")
+            samples.append(inspect_image(path))
+            root = Path(os.environ["FILESYSTEM_ROOT"])
+            paths.add(str((root / path).resolve()))
+    finally:
+        random.setstate(state)
+    passed = (
+        all(sample["nonblank"] for sample in samples)
+        and len({sample["pixel_digest"] for sample in samples}) == 3
+        and len(paths) == 3
+    )
+    return {
+        "passed": passed,
+        "target": "developer",
+        "samples": samples,
+        "distinct_paths": len(paths),
+        "distinct_pixels": len({sample["pixel_digest"] for sample in samples}),
+        "feedback": ""
+        if passed
+        else "Images must contain drawn pixels and differ across controlled seeds; "
+        "unique filenames alone are insufficient.",
+    }
+
+
 async def run(request: dict) -> dict:
     if request["action"] == "probe":
         return {"ready": True}
+    if request["action"] == "inspect_image":
+        return inspect_image(request["payload"]["path"])
     if request["action"] == "reference":
         return symbolic_references(request["payload"]["expressions"])
     manifest = request["manifest"]
     module = load_module(request["directory"])
+    if request["action"] == "image_probe":
+        return await probe_images(module, manifest)
     if request["action"] == "test":
         return run_tests(request["directory"])
     function = getattr(module, manifest["entrypoint"])

@@ -13,6 +13,12 @@ from uuid import uuid4
 from t_bot.config import Settings
 from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
 from t_bot.errors import BotError
+from t_bot.image_quality import (
+    audit_image_tests,
+    image_contract,
+    image_review_schema,
+    validate_size_claims,
+)
 from t_bot.ollama import Ollama
 from t_bot.qa_expectations import (
     NoProgressGuard,
@@ -549,6 +555,7 @@ class ExtensionTeam:
                                 "implementation": candidate,
                                 "feedback": feedback,
                                 "previous_tests": tests,
+                                "image_contract": image_contract(request, final_spec),
                             }
                         ),
                         QA_SCHEMA,
@@ -570,6 +577,14 @@ class ExtensionTeam:
                         semantics=oracle.get("semantics"),
                         references=oracle.get("values"),
                     )
+                    contract = oracle.get("image_contract", image_contract(request, final_spec))
+                    if contract["enabled"] and expectations["passed"]:
+                        image_audit = audit_image_tests(tests, contract)
+                        expectations["image_checks"] = image_audit
+                        if not image_audit["passed"]:
+                            expectations.update(
+                                passed=False, target="qa", findings=image_audit["findings"]
+                            )
                     await record("QAExpectations", expectations)
                     if not expectations["passed"]:
                         feedback = {"expectations": expectations}
@@ -595,6 +610,11 @@ class ExtensionTeam:
                         )
                         continue
                     await advance_progress(2, "expectations_audit_passed")
+
+                    async def check_image_review(review: dict, facts: dict = contract) -> None:
+                        if facts["enabled"]:
+                            validate_size_claims(review, facts)
+
                     test_review = await ask(
                         "Reviewer",
                         json.dumps(
@@ -605,6 +625,7 @@ class ExtensionTeam:
                                 "manifest": candidate["manifest"],
                                 "tests": tests,
                                 "trusted_checks": expectations,
+                                "image_contract": contract,
                                 "instruction": "Review ONLY test oracles against requirements. "
                                 "Verify numbers and exception contracts independently. "
                                 "Do not require unspecified prose. Route bad tests to qa, "
@@ -614,8 +635,11 @@ class ExtensionTeam:
                                 "Any disputed assertion needs a concrete conflicting reference.",
                             }
                         ),
-                        TEST_REVIEW_SCHEMA,
+                        image_review_schema(TEST_REVIEW_SCHEMA)
+                        if contract["enabled"]
+                        else TEST_REVIEW_SCHEMA,
                         "qa_expectations",
+                        check=check_image_review,
                     )
                     await record("TestReview", test_review)
                     if test_review["decision"] != "approve":
@@ -689,13 +713,17 @@ class ExtensionTeam:
                                 "implementation": candidate,
                                 "tests": tests,
                                 "test_results": execution,
+                                "image_contract": contract,
                                 "instruction": "Approve only if tests passed. Route code bugs to "
                                 "developer, test defects to qa, and contradictory requirements "
                                 "to pm; explain findings.",
                             }
                         ),
-                        REVIEW_SCHEMA,
+                        image_review_schema(REVIEW_SCHEMA)
+                        if contract["enabled"]
+                        else REVIEW_SCHEMA,
                         "qa_triage",
+                        check=check_image_review,
                     )
                     review = await ask(
                         "Reviewer",
@@ -705,12 +733,16 @@ class ExtensionTeam:
                                 "implementation": candidate,
                                 "tests": tests,
                                 "test_results": execution,
+                                "image_contract": contract,
                                 "qa_notes": qa["notes"],
                                 "qa_triage": triage,
                             }
                         ),
-                        REVIEW_SCHEMA,
+                        image_review_schema(REVIEW_SCHEMA)
+                        if contract["enabled"]
+                        else REVIEW_SCHEMA,
                         "reviewer",
+                        check=check_image_review,
                     )
                     feedback = {"execution": execution, "qa": triage, "review": review}
                     if (

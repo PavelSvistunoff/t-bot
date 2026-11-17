@@ -19,6 +19,7 @@ from t_bot.dependencies import validate_requests
 from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
 from t_bot.errors import BotError
 from t_bot.extension_team import ExtensionTeam, TeamFailure
+from t_bot.image_quality import IMAGE_SUFFIXES, image_contract, random_image_request
 from t_bot.manifest import Manifest
 from t_bot.ollama import Ollama
 from t_bot.qa_expectations import math_expressions, math_semantics
@@ -404,6 +405,10 @@ class Extensions:
             "The working directory is FILESYSTEM_ROOT: open('example.txt') reads a file there. "
             "os.environ['FILESYSTEM_ROOT'] provides its absolute path. Do not prefix relative "
             "file paths with workspace/; paths are relative to FILESYSTEM_ROOT itself. "
+            "Save returned images in FILESYSTEM_ROOT with unique filenames; return their relative "
+            "file_path. TMPDIR is deleted after each call and is never a deliverable location. "
+            "Random image features must affect rendered pixels, not just filenames. "
+            "Keep canvas dimensions separate from head/feature geometry. "
             "Use TMPDIR for temporary files. Validation runs the example: "
             "keep it safe and avoid modifying existing user files. "
             "Standard-library modules (math, json, typing, sys, pathlib) are already built in; "
@@ -438,15 +443,14 @@ class Extensions:
         async def reference_values(generated: dict, tests: str, spec: dict) -> dict:
             manifest = generated["manifest"]
             semantics = math_semantics(request, manifest)
-            if semantics != "sympy":
-                return {"semantics": semantics, "values": {}}
-            expressions = math_expressions(tests, spec, manifest.get("example", {}))
-            return await self.sandbox.execute(
-                None,
-                manifest,
-                "reference",
-                {"expressions": expressions},
-            )
+            oracle = {"semantics": semantics, "values": {}}
+            if semantics == "sympy":
+                expressions = math_expressions(tests, spec, manifest.get("example", {}))
+                oracle = await self.sandbox.execute(
+                    None, manifest, "reference", {"expressions": expressions}
+                )
+            oracle["image_contract"] = image_contract(request, spec)
+            return oracle
 
         async def validate_candidate(generated: dict) -> dict:
             if permissions is not None:
@@ -469,6 +473,36 @@ class Extensions:
                 validated["smoke_result"] = verify_smoke_result(
                     request, candidate.model_dump(), result, oracle
                 )
+                path = next(
+                    (result[key] for key in ("file_path", "image_path", "path") if key in result),
+                    None,
+                )
+                if isinstance(path, str) and Path(path).suffix.casefold() in IMAGE_SUFFIXES:
+                    metadata = await self.sandbox.execute(
+                        None, candidate.model_dump(), "inspect_image", {"path": path}
+                    )
+                    if not metadata["nonblank"]:
+                        raise BotError(
+                            "Зображення порожнє: потрібен намальований вміст, а не лише файл."
+                        )
+                    validated["smoke_result"]["image"] = metadata
+                if random_image_request(request):
+                    if (
+                        not isinstance(path, str)
+                        or Path(path).suffix.casefold() not in IMAGE_SUFFIXES
+                    ):
+                        raise BotError(
+                            "Генератор має повертати шлях до зображення у FILESYSTEM_ROOT."
+                        )
+                    with tempfile.TemporaryDirectory(prefix="team-images-") as temporary:
+                        directory = Path(temporary)
+                        (directory / "extension.py").write_text(generated["source"])
+                        checks = await self.sandbox.execute(
+                            directory, candidate.model_dump(), "image_probe", {}
+                        )
+                    if not checks["passed"]:
+                        raise BotError(checks["feedback"])
+                    validated["smoke_result"]["image_checks"] = checks
             return validated
 
         async def execute_tests(generated: dict, tests: str) -> dict:
@@ -530,7 +564,7 @@ class Extensions:
             status="active",
             stage="completed",
             version=record.manifest.version,
-            candidate={"manifest": record.manifest.model_dump(), "source": generated["source"]},
+            candidate={**generated, "manifest": record.manifest.model_dump()},
         )
         await self.team.save(report)
         reporter.emit(
