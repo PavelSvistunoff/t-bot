@@ -42,8 +42,8 @@ class Settings(BaseSettings):
     sandbox_timeout_seconds: PositiveInt = 30
     max_llm_calls: PositiveInt = 16
     extension_team_timeout_seconds: PositiveInt = 900
-    extension_team_max_rounds: Annotated[int, Field(ge=1, le=10)] = 3
-    extension_team_stage_attempts: Annotated[int, Field(ge=1, le=5)] = 2
+    extension_team_max_rounds: PositiveInt = 3
+    extension_team_stage_attempts: PositiveInt = 2
     extension_team_max_calls: PositiveInt = 24
     extension_team_fallback_models: list[str] = Field(default_factory=list)
     max_delegation_depth: PositiveInt = 3

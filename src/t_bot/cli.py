@@ -7,9 +7,30 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from t_bot.config import Settings
 from t_bot.errors import BotError
 from t_bot.logging_setup import configure_logging
+
+
+def validation_error_message(error: ValidationError) -> str:
+    """Name invalid settings without exposing Pydantic input values or validator exceptions."""
+    hints = {
+        "int_parsing": "очікується ціле число",
+        "int_type": "очікується ціле число",
+        "greater_than": "значення має бути додатним",
+        "greater_than_equal": "значення менше дозволеного мінімуму",
+        "less_than_equal": "значення перевищує дозволений максимум",
+        "list_type": "очікується JSON-список",
+        "value_error": "недопустиме значення",
+    }
+    lines = ["Помилка конфігурації/даних запуску:"]
+    for item in error.errors(include_input=False, include_context=False, include_url=False):
+        name = item["loc"][0] if item["loc"] else None
+        label = str(name).upper() if name in Settings.model_fields else "Дані запуску"
+        lines.append(f"{label}: {hints.get(item['type'], 'некоректний тип або формат')}")
+    return "\n".join(lines)
 
 
 async def doctor(settings: Settings) -> int:
@@ -109,6 +130,9 @@ def main() -> None:
         else:
             backup(settings, args.destination)
             code = 0
+    except ValidationError as exc:
+        print(validation_error_message(exc))
+        code = 1
     except (BotError, ValueError, OSError) as exc:
         # Pydantic errors can include secret input values, so do not print validation reprs.
         print(

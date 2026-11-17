@@ -599,3 +599,9 @@ Python-тести в Ollama JSON-mode, QA повертає масив рядкі
 ```bash
 RUN_LIVE=1 RUN_TEAM_TESTS=1 uv run pytest tests/test_live.py -k real_extension_team -q
 ```
+
+
+`EXTENSION_TEAM_MAX_ROUNDS` та `EXTENSION_TEAM_STAGE_ATTEMPTS` приймають будь-які
+додатні цілі значення (наприклад 30 і 20). Загальний час і кількість модельних викликів
+окремо обмежуються `EXTENSION_TEAM_TIMEOUT_SECONDS` та `EXTENSION_TEAM_MAX_CALLS`.
+При помилці конфігурації CLI показує назву поля та тип проблеми без значень із `.env`.
