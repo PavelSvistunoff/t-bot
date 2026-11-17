@@ -67,6 +67,13 @@ def specification():
         for name in SPEC_SCHEMA["required"]
     }
     result["happy_path"] = ["Випадкові параметри, наприклад розмір голови 200x200."]
+    result["source_checks"] = [
+        {
+            "conclusion": "Use documentation",
+            "url": "https://docs.python.org/3/",
+            "quote": "Official Python documentation",
+        }
+    ]
     return result
 
 
@@ -172,7 +179,20 @@ def test_review_cannot_omit_evidence_for_a_canvas_requirement():
     contract = image_contract(REQUEST, specification())
     with pytest.raises(BotError, match="size_claims"):
         validate_size_claims(
-            {"decision": "qa", "findings": ["Canvas must be 200x200"], "size_claims": []}, contract
+            {
+                "decision": "qa",
+                "findings": ["Canvas must be 200x200"],
+                "justifications": [
+                    {
+                        "finding_index": 0,
+                        "code": {"pointer": "/implementation/source", "quote": "Image.new"},
+                        "basis": {"pointer": "/spec/happy_path/0", "quote": "200x200"},
+                        "impact": "Wrong output canvas dimensions",
+                    }
+                ],
+                "size_claims": [],
+            },
+            contract,
         )
 
 
@@ -255,6 +275,14 @@ async def test_pipeline_repairs_tmp_path_weak_qa_and_canvas_head_confusion(
                     return {
                         "decision": "developer",
                         "findings": ["Canvas must be 200x200"],
+                        "justifications": [
+                            {
+                                "finding_index": 0,
+                                "code": {"pointer": "/implementation/source", "quote": "Image.new"},
+                                "basis": {"pointer": "/spec/happy_path/0", "quote": "200x200"},
+                                "impact": "Wrong output canvas dimensions",
+                            }
+                        ],
                         "size_claims": [
                             {
                                 "subject": "canvas",

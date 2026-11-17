@@ -15,8 +15,19 @@ REQUEST = "Створи інструмент для обчислення мат�
 
 def specification():
     return {
-        name: "Math calculator" if name == "objective" else ["Math requirements"]
-        for name in SPEC_SCHEMA["required"]
+        **(
+            {
+                name: "Math calculator" if name == "objective" else ["Math requirements"]
+                for name in SPEC_SCHEMA["required"]
+            }
+        ),
+        "source_checks": [
+            {
+                "conclusion": "Use official documentation",
+                "url": "https://docs.python.org/3/",
+                "quote": "Official Python documentation",
+            }
+        ],
     }
 
 

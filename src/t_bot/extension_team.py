@@ -25,12 +25,20 @@ from t_bot.qa_expectations import (
     audit_specification,
 )
 from t_bot.team_agents import RoleAgents
+from t_bot.team_evidence import (
+    EVIDENCE_SCHEMA,
+    QUALITY_RULES,
+    EvidenceError,
+    evidence_examples,
+    validate_analysis,
+    validate_review_justifications,
+)
 from t_bot.web_search import WebSearch
 from t_bot.webpage import WebpageReader
 
 logger = logging.getLogger(__name__)
 
-SPEC_SCHEMA = {
+SPEC_SCHEMA: dict = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -99,6 +107,36 @@ REVIEW_SCHEMA = {
 
 CODE_REVIEW_SCHEMA: dict = copy.deepcopy(REVIEW_SCHEMA)
 CODE_REVIEW_SCHEMA["properties"]["decision"] = {"enum": ["approve", "developer", "pm"]}
+CODE_REVIEW_SCHEMA["properties"]["justifications"] = {
+    "type": "array",
+    "maxItems": 20,
+    "items": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "finding_index": {"type": "integer", "minimum": 0},
+            "code": EVIDENCE_SCHEMA,
+            "basis": EVIDENCE_SCHEMA,
+            "impact": {"type": "string", "minLength": 1, "maxLength": 1000},
+        },
+        "required": ["finding_index", "code", "basis", "impact"],
+    },
+}
+ANALYSIS_SCHEMA: dict = copy.deepcopy(SPEC_SCHEMA)
+ANALYSIS_SCHEMA["properties"]["source_checks"] = {
+    "type": "array",
+    "minItems": 1,
+    "maxItems": 10,
+    "items": {
+        "type": "object",
+        "properties": {
+            key: {"type": "string", "minLength": 1, "maxLength": 1000}
+            for key in ("conclusion", "url", "quote")
+        },
+        "required": ["conclusion", "url", "quote"],
+    },
+}
+ANALYSIS_SCHEMA["required"] = [*SPEC_SCHEMA["required"], "source_checks"]
 
 
 class TeamFailure(BotError):
@@ -242,6 +280,12 @@ class ExtensionTeam:
             preferred_model: str | None = None,
         ) -> dict:
             errors: list[str] = []
+            failure_counts: dict[str, int] = {}
+            attempts = (
+                min(self.settings.extension_team_stage_attempts, 3)
+                if role == "Supervisor"
+                else self.settings.extension_team_stage_attempts
+            )
             primary = preferred_model or model
             models = list(
                 dict.fromkeys(
@@ -252,7 +296,7 @@ class ExtensionTeam:
                     ]
                 )
             )
-            for attempt in range(self.settings.extension_team_stage_attempts):
+            for attempt in range(attempts):
                 if report["calls"] >= self.settings.extension_team_max_calls:
                     raise BotError("Вичерпано бюджет викликів команди.")
                 selected = models[min(attempt, len(models) - 1)]
@@ -265,7 +309,7 @@ class ExtensionTeam:
                     report["id"],
                     selected,
                     attempt + 1,
-                    self.settings.extension_team_stage_attempts,
+                    attempts,
                 )
                 reporter.emit(event)
                 try:
@@ -302,7 +346,7 @@ class ExtensionTeam:
                             report["id"],
                             selected,
                             attempt + 1,
-                            self.settings.extension_team_stage_attempts,
+                            attempts,
                             "Причину збережено у звіті конвеєра.",
                         )
                     )
@@ -315,10 +359,22 @@ class ExtensionTeam:
                             "response": getattr(exc, "response", ""),
                         },
                     )
-                    if (
-                        len(models) == 1
-                        and attempt + 1 < self.settings.extension_team_stage_attempts
-                    ):
+                    failure_key = exc.failure_kind if isinstance(exc, EvidenceError) else errors[-1]
+                    failure_counts[failure_key] = failure_counts.get(failure_key, 0) + 1
+                    if check is not None and failure_counts[failure_key] >= 3:
+                        await record(
+                            "RoleStagnation",
+                            {
+                                "role": role,
+                                "failure_kind": failure_key,
+                                "attempts": attempt + 1,
+                            },
+                        )
+                        raise BotError(
+                            f"{role}: зациклення перевірки доказів; три повторні відмови "
+                            f"({failure_key}). Поточні артефакти та звіт збережено."
+                        ) from exc
+                    if len(models) == 1 and attempt + 1 < attempts:
                         try:
                             available = await self.roles.ollama.models()
                             alternatives = [
@@ -393,6 +449,7 @@ class ExtensionTeam:
                     supervisor.check_review(
                         review, context.get("implementation", {}).get("source", "")
                     )
+                    validate_review_justifications(review, context)
                     await check(review)
                 except BotError as exc:
                     await record(
@@ -426,7 +483,10 @@ class ExtensionTeam:
                             "evidence": evidence,
                             "allowed_actions": sorted(allowed),
                             "progress": report.get("progress"),
-                            "instruction": "Resolve the conflict. Pointers are rooted in evidence. "
+                            "evidence_examples": evidence_examples(evidence),
+                            "instruction": "Resolve the conflict. Pointers are rooted in evidence, "
+                            "not the wrapper: /implementation/source, NOT implementation.source "
+                            "or /evidence/implementation/source. Quotes must be exact substrings. "
                             "Return unsupported objections to reviewer. "
                             "Route genuine defects to their owner. "
                             "You cannot approve activation or bypass tests and requirements.",
@@ -440,7 +500,7 @@ class ExtensionTeam:
                 return advice
 
             review = await ask("Reviewer", json.dumps(context), schema, phase, check=checked)
-            allowed = {"qa", "pm", "reviewer", "stop"}
+            allowed = {"pm", "reviewer", "stop"}
             if phase == "reviewer":
                 allowed.add("developer")
 
@@ -588,11 +648,16 @@ class ExtensionTeam:
                         "Аналітик не зміг перевірити джерела через read_webpage: "
                         "немає доступних сторінок із текстом."
                     )
+
+                async def check_analysis(result: dict, sources: list[dict]) -> None:
+                    validate_analysis(result, sources)
+
                 analysis = await ask(
                     "Analyst",
                     json.dumps({"draft": draft, "web_results": research, "web_pages": pages}),
-                    SPEC_SCHEMA,
+                    ANALYSIS_SCHEMA,
                     "analyst_revision",
+                    check=lambda result: check_analysis(result, pages),
                 )
                 final_spec = await ask(
                     "PM",
@@ -817,6 +882,7 @@ class ExtensionTeam:
                     review, review_route = await coordinated_review(
                         {
                             "spec": final_spec,
+                            "quality_rules": QUALITY_RULES,
                             "implementation": {
                                 "manifest": candidate["manifest"],
                                 "source": candidate["source"],

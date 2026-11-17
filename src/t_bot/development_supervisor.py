@@ -1,10 +1,10 @@
 """Python development policy; model advice can route work but cannot approve activation."""
 
-import json
 import re
 
 from t_bot.errors import BotError
 from t_bot.qa_expectations import NoProgressGuard, StagnationGuard
+from t_bot.team_evidence import validate_evidence
 
 SUPERVISOR_SCHEMA = {
     "type": "object",
@@ -44,24 +44,7 @@ def validate_advice(advice: dict, context: dict, allowed: set[str]) -> None:
     if advice["action"] not in allowed:
         raise BotError("Supervisor запропонував недопустимий перехід для цього етапу.")
     for evidence in advice["evidence"]:
-        pointer = evidence["pointer"]
-        try:
-            if not pointer.startswith("/"):
-                raise ValueError("Expected JSON pointer")
-            value = context
-            for part in pointer[1:].split("/"):
-                key = part.replace("~1", "/").replace("~0", "~")
-                if isinstance(value, list):
-                    if not re.fullmatch(r"0|[1-9][0-9]*", key):
-                        raise ValueError("Invalid array pointer")
-                    value = value[int(key)]
-                else:
-                    value = value[key]
-        except (KeyError, ValueError, IndexError, TypeError) as exc:
-            raise BotError("Supervisor послався на неіснуючий доказ.") from exc
-        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-        if not evidence["quote"].strip() or evidence["quote"] not in text:
-            raise BotError("Цитата Supervisor не відповідає фактичному доказу.")
+        validate_evidence(evidence, context)
 
 
 class DevelopmentSupervisor:
@@ -82,17 +65,23 @@ class DevelopmentSupervisor:
     def check_review(review: dict, source: str = "") -> None:
         if review["decision"] not in {"approve", "developer", "pm"}:
             raise BotError("Reviewer оцінює лише код Developer; якість тестів належить QA.")
-        if review["decision"] == "approve":
-            return
         for finding in review.get("findings", []):
             qa_tokens = re.findall(
                 r"\btest_(?:happy|failure|edge)_\w+|\bassert(?:Equal|AlmostEqual|Raises|In|NotEqual)\b",
                 finding,
             )
-            if any(token not in source for token in qa_tokens):
+            qa_quality = re.search(
+                r"(?:QA|tests?|тест\w*).{0,45}(?:quality|coverage|якіст|покрит|перепис|rewrite)"
+                r"|(?:quality|coverage|якіст|покрит|перепис|rewrite).{0,45}(?:QA|tests?|тест\w*)",
+                finding,
+                re.IGNORECASE,
+            )
+            if qa_quality or any(token not in source for token in qa_tokens):
                 raise BotError(
                     "Reviewer має переглянути код Developer; assertions і тести оцінює QA."
                 )
+        if review["decision"] == "approve":
+            return
         meaningful = [
             finding
             for finding in review.get("findings", [])

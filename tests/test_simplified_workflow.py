@@ -45,8 +45,19 @@ def artifact():
 
 def spec():
     return {
-        name: "Double integers" if name == "objective" else ["Preserve requirements"]
-        for name in SPEC_SCHEMA["required"]
+        **(
+            {
+                name: "Double integers" if name == "objective" else ["Preserve requirements"]
+                for name in SPEC_SCHEMA["required"]
+            }
+        ),
+        "source_checks": [
+            {
+                "conclusion": "Use official documentation",
+                "url": "https://docs.python.org/3/",
+                "quote": "Official Python documentation",
+            }
+        ],
     }
 
 

@@ -51,10 +51,21 @@ def candidate(source=SOURCE):
 
 def spec():
     return {
-        key: "Double every integer including zero"
-        if key == "objective"
-        else ["Preserve the requested behavior"]
-        for key in SPEC_SCHEMA["required"]
+        **(
+            {
+                key: "Double every integer including zero"
+                if key == "objective"
+                else ["Preserve the requested behavior"]
+                for key in SPEC_SCHEMA["required"]
+            }
+        ),
+        "source_checks": [
+            {
+                "conclusion": "Use official documentation",
+                "url": "https://docs.python.org/3/",
+                "quote": "Official Python documentation",
+            }
+        ],
     }
 
 
@@ -177,6 +188,14 @@ def scripted_roles(*, mode, calls):
             return {
                 "decision": "qa" if mode == "failed_tests" else "developer",
                 "findings": ["Concrete finding disputed by QA"],
+                "justifications": [
+                    {
+                        "finding_index": 0,
+                        "code": {"pointer": "/implementation/source", "quote": "return"},
+                        "basis": {"pointer": "/user_request", "quote": data["user_request"]},
+                        "impact": "The requested doubling may be incorrect for zero",
+                    }
+                ],
             }
         return spec()
 
@@ -281,6 +300,14 @@ async def test_supervisor_does_not_reset_progress_for_changing_artifacts(
                 if role == "QA" or data.get("phase") == "qa_expectations_review"
                 else "developer",
                 "findings": ["Concrete disputed implementation finding"],
+                "justifications": [
+                    {
+                        "finding_index": 0,
+                        "code": {"pointer": "/implementation/source", "quote": "return"},
+                        "basis": {"pointer": "/user_request", "quote": "Double integers"},
+                        "impact": "Incorrect doubling for a requested input",
+                    }
+                ],
             }
         return spec()
 
@@ -344,7 +371,19 @@ async def test_persistent_reviewer_conflict_is_bounded_without_rewriting_qa(
     async def ask(role, model, context, schema):
         result = await callback(role, model, context, schema)
         if role == "Reviewer" and '"supervisor_feedback"' in context:
-            return {"decision": "developer", "findings": ["Unresolved disputed finding"]}
+            return {
+                **result,
+                "decision": "developer",
+                "findings": ["Unresolved disputed finding"],
+                "justifications": [
+                    {
+                        "finding_index": 0,
+                        "code": {"pointer": "/implementation/source", "quote": "return"},
+                        "basis": {"pointer": "/user_request", "quote": "Double integers"},
+                        "impact": "Unresolved correctness concern",
+                    }
+                ],
+            }
         return result
 
     monkeypatch.setattr(extensions.team.roles, "ask", ask)
@@ -355,3 +394,100 @@ async def test_persistent_reviewer_conflict_is_bounded_without_rewriting_qa(
     assert sum(role == "Developer" for role, _ in calls) == 1
     assert sum(role == "QA" and '"previous_tests"' in context for role, context in calls) == 1
     assert not extensions.records()
+
+
+@pytest.mark.sandbox
+async def test_repeated_invalid_supervisor_evidence_stops_before_twenty_retries(
+    components, settings, monkeypatch
+):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    settings.extension_team_stage_attempts = 20
+    settings.extension_team_max_calls = 60
+    calls = []
+    callback = scripted_roles(mode="repair_review", calls=calls)
+    supervisor_inputs = []
+
+    async def ask(role, model, context, schema):
+        if role == "Reviewer":
+            data = json.JSONDecoder().raw_decode(context)[0]
+            assert not {"tests", "test_results", "qa_notes", "qa_triage"} & data.keys()
+            assert set(data["implementation"]) == {"source", "manifest"}
+        if role == "Supervisor":
+            calls.append((role, context))
+            supervisor_inputs.append(context)
+            # Different prose and fabricated quotes must not reset failure counting.
+            return advice(
+                "developer", "implementation.source", f"fabricated version {len(supervisor_inputs)}"
+            )
+        return await callback(role, model, context, schema)
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    with pytest.raises(TeamFailure) as failure:
+        await extensions.create("Double integers", "tool", "supervised_double", "root", "", 1)
+    assert len(supervisor_inputs) == 3
+    assert "/implementation/source" in supervisor_inputs[1]
+    assert "зациклення" in failure.value.report["error"]
+    assert failure.value.report["last_valid_candidate"]["source"] == SOURCE
+    assert any(event["stage"] == "RoleStagnation" for event in failure.value.report["events"])
+    assert not extensions.records()
+
+
+@pytest.mark.sandbox
+async def test_analyst_repairs_unread_citation_before_pm_approval(components, monkeypatch):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    calls = []
+    callback = scripted_roles(mode="empty_review", calls=calls)
+    analyst_revisions = []
+
+    async def ask(role, model, context, schema):
+        if role == "Analyst" and "source_checks" in schema["properties"]:
+            analyst_revisions.append(context)
+            result = spec()
+            if len(analyst_revisions) == 1:
+                result["source_checks"][0]["url"] = "https://unread.example/"
+            return result
+        return await callback(role, model, context, schema)
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    result = await extensions.create("Double integers", "tool", "supervised_double", "root", "", 1)
+    assert result["status"] == "active"
+    assert len(analyst_revisions) == 2
+    assert "успішно прочитаним" in analyst_revisions[1]
+    pm_final = next(
+        context for role, context in calls if role == "PM" and "analyst_revision" in context
+    )
+    assert "unread.example" not in pm_final
+    assert "Official Python documentation" in pm_final
+
+
+@pytest.mark.sandbox
+async def test_reviewer_repair_never_receives_qa_advice_or_results(components, monkeypatch):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    calls = []
+    callback = scripted_roles(mode="repair_review", calls=calls)
+    repaired = []
+
+    async def ask(role, model, context, schema):
+        if role == "Supervisor":
+            return {**advice(), "reason": "PRIVATE_QA_NOTES: rewrite QA assertions"}
+        if role == "Reviewer":
+            data = json.JSONDecoder().raw_decode(context)[0]
+            assert (
+                not {"tests", "test_results", "qa_notes", "qa_triage", "trusted_checks"}
+                & data.keys()
+            )
+            assert set(data["implementation"]) == {"source", "manifest"}
+            assert "PRIVATE_QA_NOTES" not in context
+            if "supervisor_feedback" in data:
+                repaired.append(data)
+                assert data["supervisor_feedback"]["code_evidence"] == []
+        return await callback(role, model, context, schema)
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    result = await extensions.create("Double integers", "tool", "supervised_double", "root", "", 1)
+    assert result["status"] == "active"
+    assert len(repaired) == 1
+    assert sum(role == "QA" and '"previous_tests"' in context for role, context in calls) == 1

@@ -97,8 +97,17 @@ class ContractTests(unittest.TestCase):
             if "queries" in schema.get("properties", {}):
                 return {"queries": ["Python official documentation"]}
             return {
-                name: "Objective" if name == "objective" else ["Acceptance"]
-                for name in SPEC_SCHEMA["required"]
+                "source_checks": [
+                    {
+                        "conclusion": "Use documentation",
+                        "url": "https://docs.python.org/3/",
+                        "quote": "Official Python documentation",
+                    }
+                ],
+                **{
+                    name: "Objective" if name == "objective" else ["Acceptance"]
+                    for name in SPEC_SCHEMA["required"]
+                },
             }
 
         monkeypatch.setattr(extensions.team.roles, "ask", other_roles)

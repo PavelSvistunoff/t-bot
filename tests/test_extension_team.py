@@ -53,8 +53,19 @@ def artifact():
 
 def spec():
     return {
-        name: "Double integer" if name == "objective" else ["Check behavior"]
-        for name in SPEC_SCHEMA["required"]
+        **(
+            {
+                name: "Double integer" if name == "objective" else ["Check behavior"]
+                for name in SPEC_SCHEMA["required"]
+            }
+        ),
+        "source_checks": [
+            {
+                "conclusion": "Use official documentation",
+                "url": "https://docs.python.org/3/",
+                "quote": "Official Python documentation",
+            }
+        ],
     }
 
 
@@ -219,9 +230,10 @@ async def test_team_cancellation_persists_report(components, monkeypatch):
 
 async def test_roles_run_through_adk():
     client = type("Client", (), {})()
-    client.generate = AsyncMock(return_value=json.dumps(spec()))
+    expected = {key: value for key, value in spec().items() if key in SPEC_SCHEMA["properties"]}
+    client.generate = AsyncMock(return_value=json.dumps(expected))
     result = await RoleAgents(client).ask("PM", "fake", "User task", SPEC_SCHEMA)
-    assert result == spec()
+    assert result == expected
     assert "project manager" in client.generate.call_args.args[1]
 
 

@@ -44,6 +44,13 @@ def spec(bad=False):
     }
     if bad:
         data["failure_path"] = ["Синтаксична помилка Python: '5++2'"]
+    data["source_checks"] = [
+        {
+            "conclusion": "Use documentation",
+            "url": "https://docs.python.org/3/",
+            "quote": "Official Python documentation",
+        }
+    ]
     return data
 
 

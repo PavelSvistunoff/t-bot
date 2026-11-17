@@ -21,7 +21,9 @@ def image_contract(request: str, spec: dict) -> dict:
     sources = [("user_request", 0, request)]
     for section, cases in spec.items():
         if isinstance(cases, list):
-            sources.extend((section, index, text) for index, text in enumerate(cases))
+            sources.extend(
+                (section, index, text) for index, text in enumerate(cases) if isinstance(text, str)
+            )
     for section, index, text in sources:
         for match in DIMENSION.finditer(text):
             anchors = list(

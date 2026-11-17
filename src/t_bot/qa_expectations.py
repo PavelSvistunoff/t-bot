@@ -113,6 +113,8 @@ def math_expressions(spec: dict, example: dict) -> list[str]:
     for cases in spec.values():
         if isinstance(cases, list):
             for case in cases:
+                if not isinstance(case, str):
+                    continue
                 expressions.extend(re.findall(r"['\"`]([^'\"`]+)['\"`]", case))
     return list(dict.fromkeys(value for value in expressions if 0 < len(value) <= 512))[:128]
 
