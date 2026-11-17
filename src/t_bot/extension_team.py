@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from t_bot.config import Settings
 from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
+from t_bot.development_supervisor import SUPERVISOR_SCHEMA, DevelopmentSupervisor, validate_advice
 from t_bot.errors import BotError
 from t_bot.image_quality import (
     audit_image_tests,
@@ -21,8 +22,6 @@ from t_bot.image_quality import (
 )
 from t_bot.ollama import Ollama
 from t_bot.qa_expectations import (
-    NoProgressGuard,
-    StagnationGuard,
     artifact_fingerprint,
     audit_specification,
     audit_tests,
@@ -240,12 +239,19 @@ class ExtensionTeam:
             schema: dict,
             phase: str,
             check: Callable[[dict], Awaitable[None]] | None = None,
+            preferred_model: str | None = None,
         ) -> dict:
             errors: list[str] = []
-            models = [
-                model,
-                *[m for m in self.settings.extension_team_fallback_models if m != model],
-            ]
+            primary = preferred_model or model
+            models = list(
+                dict.fromkeys(
+                    [
+                        primary,
+                        *self.settings.extension_team_fallback_models,
+                        *([model] if primary != model else []),
+                    ]
+                )
+            )
             for attempt in range(self.settings.extension_team_stage_attempts):
                 if report["calls"] >= self.settings.extension_team_max_calls:
                     raise BotError("Вичерпано бюджет викликів команди.")
@@ -276,6 +282,8 @@ class ExtensionTeam:
                     if check is not None:
                         await check(result)
                     detail = ""
+                    if "action" in result:
+                        detail = "Наступна дія: " + result["action"] + "."
                     if "decision" in result:
                         decision = {
                             "approve": "Схвалено.",
@@ -322,8 +330,10 @@ class ExtensionTeam:
                             pass  # Keep retrying the primary model if discovery is unavailable.
             raise BotError(f"{role}: усі спроби завершилися помилкою. {errors[-1]}")
 
-        guard = StagnationGuard(self.settings.extension_team_stagnation_limit)
-        progress_guard = NoProgressGuard(self.settings.extension_team_no_progress_limit)
+        supervisor = DevelopmentSupervisor(
+            self.settings.extension_team_stagnation_limit,
+            self.settings.extension_team_no_progress_limit,
+        )
         milestone = 0
 
         async def advance_progress(level: int, stage: str) -> None:
@@ -341,22 +351,21 @@ class ExtensionTeam:
             tests: str = "",
             phase: str = "",
         ) -> str:
-            stalled = progress_guard.observe(milestone)
-            if stalled is not None:
-                await record("NoProgress", stalled)
-                raise BotError(
-                    "Немає прогресу між версіями коду та тестів: "
-                    f"{stalled['failed_rounds']} раундів без нового контрольного етапу. "
-                    "Усі спроби та останній валідний кандидат (якщо він є) збережено."
-                )
             state = (
                 {"phase": phase, **artifact_fingerprint(candidate, tests)}
                 if candidate is not None
                 else None
             )
-            escalation = guard.observe(evidence, proposed, state=state)
+            escalation = supervisor.observe_rework(evidence, proposed, state, milestone)
             if escalation is None:
                 return proposed
+            if escalation["stage"] == "NoProgress":
+                await record("NoProgress", escalation)
+                raise BotError(
+                    "Немає прогресу між версіями коду та тестів: "
+                    f"{escalation['failed_rounds']} раундів без нового контрольного етапу. "
+                    "Supervisor зупинив роботу; артефакти збережено."
+                )
             await record("Stagnation", escalation)
             if escalation["stop"]:
                 artifacts = (
@@ -368,6 +377,118 @@ class ExtensionTeam:
                     "Зациклення: повторюються однакові помилки після доопрацювань. " + artifacts
                 )
             return escalation["target"]
+
+        async def coordinated_review(
+            context: dict,
+            schema: dict,
+            phase: str,
+            check: Callable[[dict], Awaitable[None]],
+        ) -> tuple[dict, str | None]:
+            context = {**context, "user_request": request}
+
+            async def checked(review: dict) -> None:
+                try:
+                    supervisor.check_review(review)
+                    await check(review)
+                except BotError as exc:
+                    await record(
+                        "SupervisorDecision",
+                        {
+                            "mode": "python",
+                            "action": "reviewer",
+                            "reason": str(exc),
+                            "phase": phase,
+                        },
+                    )
+                    raise
+
+            async def request_advice(evidence: dict, allowed: set[str]) -> dict:
+                await record(
+                    "SupervisorContext",
+                    {
+                        "phase": phase,
+                        "evidence": evidence,
+                        "allowed_actions": sorted(allowed),
+                    },
+                )
+
+                async def check_advice(advice: dict) -> None:
+                    validate_advice(advice, evidence, allowed)
+
+                advice = await ask(
+                    "Supervisor",
+                    json.dumps(
+                        {
+                            "evidence": evidence,
+                            "allowed_actions": sorted(allowed),
+                            "progress": report.get("progress"),
+                            "instruction": "Resolve the conflict. Pointers are rooted in evidence. "
+                            "Return unsupported objections to reviewer. "
+                            "Route genuine defects to their owner. "
+                            "You cannot approve activation or bypass tests and requirements.",
+                        }
+                    ),
+                    SUPERVISOR_SCHEMA,
+                    "supervisor",
+                    check=check_advice,
+                )
+                await record("SupervisorDecision", {"mode": "llm", "phase": phase, **advice})
+                return advice
+
+            review = await ask("Reviewer", json.dumps(context), schema, phase, check=checked)
+            allowed = {"qa", "pm", "reviewer", "stop"}
+            if phase == "reviewer":
+                allowed.add("developer")
+
+            async def repair_model() -> str:
+                alternatives = [
+                    name for name in self.settings.extension_team_fallback_models if name != model
+                ]
+                if not alternatives:
+                    try:
+                        alternatives = [
+                            name
+                            for name in await self.roles.ollama.models()
+                            if name != model and "embedding" not in name
+                        ]
+                        alternatives.sort(key=lambda name: ("coder" not in name.casefold(), name))
+                    except BotError:
+                        return model
+                return alternatives[0] if alternatives else model
+
+            last_advice = None
+            # Each review can be arbitrated at most twice, within the shared call/time budgets.
+            for repair_attempt in range(2):
+                if not supervisor.needs_arbitration(review, context):
+                    return (
+                        {**review, "supervisor_advice": last_advice} if last_advice else review
+                    ), None
+                advice = await request_advice({**context, "review": review}, allowed)
+                last_advice = advice
+                if advice["action"] == "stop":
+                    raise BotError("Supervisor зупинив конвеєр: " + advice["reason"])
+                if advice["action"] != "reviewer":
+                    return {**review, "supervisor_advice": advice}, advice["action"]
+                if repair_attempt == 1:
+                    raise BotError(
+                        "Supervisor: Reviewer не узгодив зауваження з доказами; "
+                        "вичерпано перегляди, кандидат і пояснення збережено."
+                    )
+                repair = {
+                    **context,
+                    "supervisor_feedback": advice,
+                    "instruction": "Reconsider ONLY disputed findings using the evidence. "
+                    "Give concrete defects, or approve. Approval remains your responsibility.",
+                }
+                review = await ask(
+                    "Reviewer",
+                    json.dumps(repair),
+                    schema,
+                    "reviewer_rework",
+                    check=checked,
+                    preferred_model=await repair_model(),
+                )
+            return review, None
 
         async def check_specification(specification: dict) -> None:
             current_candidate = report.get("last_valid_candidate")
@@ -615,38 +736,35 @@ class ExtensionTeam:
                         if facts["enabled"]:
                             validate_size_claims(review, facts)
 
-                    test_review = await ask(
-                        "Reviewer",
-                        json.dumps(
-                            {
-                                "phase": "qa_expectations_review",
-                                "user_request": request,
-                                "spec": final_spec,
-                                "manifest": candidate["manifest"],
-                                "tests": tests,
-                                "trusted_checks": expectations,
-                                "image_contract": contract,
-                                "instruction": "Review ONLY test oracles against requirements. "
-                                "Verify numbers and exception contracts independently. "
-                                "Do not require unspecified prose. Route bad tests to qa, "
-                                "spec contradictions to pm. Approval here is NOT code approval. "
-                                "Use trusted_checks as evidence. Do not reject a verified numeric "
-                                "oracle because of rounded comments or hypothetical float errors. "
-                                "Any disputed assertion needs a concrete conflicting reference.",
-                            }
-                        ),
+                    test_review, test_route = await coordinated_review(
+                        {
+                            "phase": "qa_expectations_review",
+                            "user_request": request,
+                            "spec": final_spec,
+                            "manifest": candidate["manifest"],
+                            "tests": tests,
+                            "trusted_checks": expectations,
+                            "image_contract": contract,
+                            "instruction": "Review ONLY test oracles against requirements. "
+                            "Verify numbers and exception contracts independently. "
+                            "Do not require unspecified prose. Route bad tests to qa, "
+                            "spec contradictions to pm. Approval here is NOT code approval. "
+                            "Use trusted_checks as evidence. Do not reject a verified numeric "
+                            "oracle because of rounded comments or hypothetical float errors. "
+                            "Any disputed assertion needs a concrete conflicting reference.",
+                        },
                         image_review_schema(TEST_REVIEW_SCHEMA)
                         if contract["enabled"]
                         else TEST_REVIEW_SCHEMA,
                         "qa_expectations",
-                        check=check_image_review,
+                        check_image_review,
                     )
                     await record("TestReview", test_review)
                     if test_review["decision"] != "approve":
                         feedback = {"test_review": test_review}
                         route = await checked_route(
                             feedback,
-                            test_review["decision"],
+                            test_route or test_review["decision"],
                             candidate=candidate,
                             tests=tests,
                             phase="test_review",
@@ -725,31 +843,33 @@ class ExtensionTeam:
                         "qa_triage",
                         check=check_image_review,
                     )
-                    review = await ask(
-                        "Reviewer",
-                        json.dumps(
-                            {
-                                "spec": final_spec,
-                                "implementation": candidate,
-                                "tests": tests,
-                                "test_results": execution,
-                                "image_contract": contract,
-                                "qa_notes": qa["notes"],
-                                "qa_triage": triage,
-                            }
-                        ),
+                    review, review_route = await coordinated_review(
+                        {
+                            "spec": final_spec,
+                            "implementation": candidate,
+                            "tests": tests,
+                            "test_results": execution,
+                            "image_contract": contract,
+                            "qa_notes": qa["notes"],
+                            "qa_triage": triage,
+                        },
                         image_review_schema(REVIEW_SCHEMA)
                         if contract["enabled"]
                         else REVIEW_SCHEMA,
                         "reviewer",
-                        check=check_image_review,
+                        check_image_review,
                     )
                     feedback = {"execution": execution, "qa": triage, "review": review}
-                    if (
-                        execution.get("passed")
-                        and triage["decision"] == "approve"
-                        and review["decision"] == "approve"
-                    ):
+                    if supervisor.may_activate(execution, triage, review):
+                        await record(
+                            "SupervisorDecision",
+                            {
+                                "mode": "python",
+                                "action": "activate",
+                                "reason": "Тести пройшли; QA та Reviewer схвалили результат.",
+                                "tests_run": execution["tests_run"],
+                            },
+                        )
                         report.update(
                             status="approved", stage="completed", candidate=candidate, tests=tests
                         )
@@ -773,7 +893,7 @@ class ExtensionTeam:
                         )
                     route = await checked_route(
                         execution,
-                        route,
+                        review_route or route,
                         candidate=candidate,
                         tests=tests,
                         phase="code_review" if execution.get("passed") else "qa_execution",

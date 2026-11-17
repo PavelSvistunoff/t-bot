@@ -82,6 +82,12 @@ async def test_team_rework_routes_and_real_qa(components, monkeypatch):
 
     async def ask(role, model, context, schema):
         calls.append(role)
+        if role == "Supervisor":
+            return {
+                "action": "qa",
+                "reason": "Repair the identified test defect",
+                "evidence": [{"pointer": "/review/findings/0", "quote": "Repair concrete defect"}],
+            }
         if role == "Developer":
             counts["developer"] += 1
             result = artifact()
@@ -92,16 +98,16 @@ async def test_team_rework_routes_and_real_qa(components, monkeypatch):
             return result
         if role == "QA":
             if "decision" in schema["properties"]:
-                passed = json.loads(context)["test_results"]["passed"]
+                passed = json.JSONDecoder().raw_decode(context)[0]["test_results"]["passed"]
                 return {"decision": "approve" if passed else "developer", "findings": []}
             return {"tests": TESTS, "notes": "Positive, invalid type and zero boundary."}
         if role == "Reviewer":
-            if json.loads(context).get("phase") == "qa_expectations_review":
+            if json.JSONDecoder().raw_decode(context)[0].get("phase") == "qa_expectations_review":
                 return {"decision": "approve", "findings": []}
             counts["reviewer"] += 1
             return {
                 "decision": ["developer", "qa", "approve"][counts["reviewer"] - 1],
-                "findings": [],
+                "findings": ["Repair concrete defect"],
             }
         if "queries" in schema["properties"]:
             return {"queries": ["Python unittest official docs"]}

@@ -147,9 +147,9 @@ async def test_invalid_attempt_does_not_replace_last_valid_candidate(
         if "tests" in schema["properties"]:
             return {"tests": TESTS.replace("EXPECTED", "11.940648784182015"), "notes": "Tests"}
         if "decision" in schema["properties"]:
-            data = json.loads(context)
+            data = json.JSONDecoder().raw_decode(context)[0]
             decision = "approve" if data.get("phase") == "qa_expectations_review" else "developer"
-            return {"decision": decision, "findings": []}
+            return {"decision": decision, "findings": ["Fix the failing implementation assertion"]}
         return spec()
 
     async def validate(value):
@@ -194,12 +194,12 @@ async def test_repeated_unresolved_failures_stop_before_round_limit(
         if "tests" in schema["properties"]:
             return {"tests": TESTS.replace("EXPECTED", "11.940648784182015"), "notes": "Tests"}
         if "decision" in schema["properties"]:
-            data = json.loads(context)
+            data = json.JSONDecoder().raw_decode(context)[0]
             return {
                 "decision": "approve"
                 if data.get("phase") == "qa_expectations_review"
                 else "developer",
-                "findings": [],
+                "findings": ["Fix the failing implementation assertion"],
             }
         return spec()
 

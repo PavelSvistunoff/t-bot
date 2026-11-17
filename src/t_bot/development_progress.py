@@ -11,6 +11,8 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_SECONDS = 30
 T = TypeVar("T")
 PHASES = {
+    "supervisor": "Supervisor розбирає конфлікт між QA та Reviewer",
+    "reviewer_rework": "Reviewer переглядає зауваження за доказами Supervisor",
     "preparation": "Підготовка запиту та залежностей",
     "pipeline": "Команда розпочала розробку",
     "pm_draft": "PM складає технічне завдання",
