@@ -63,6 +63,9 @@ def backup(settings: Settings, destination: Path) -> None:
             ):
                 db.backup(target)
         shutil.copytree(settings.extensions_dir, destination / "extensions")
+        team_runs = settings.data_dir / "team_runs"
+        if team_runs.exists():
+            shutil.copytree(team_runs, destination / "team_runs")
         (destination / "metadata.json").write_text(
             json.dumps(
                 {

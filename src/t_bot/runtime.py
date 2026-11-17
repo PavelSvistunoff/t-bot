@@ -25,6 +25,7 @@ from t_bot.basic_tools import BasicTools
 from t_bot.config import Settings
 from t_bot.control import RestartControl
 from t_bot.errors import BotError
+from t_bot.extension_team import TeamFailure
 from t_bot.extensions import ExtensionRecord, Extensions
 from t_bot.help_guide import render_help
 from t_bot.ollama import Ollama
@@ -42,6 +43,7 @@ class Invocation:
     chat_id: int
     job_id: int
     calls: int = 0
+    deadline: asyncio.Timeout | None = None
 
 
 current_invocation: ContextVar[Invocation] = ContextVar("current_invocation")
@@ -185,14 +187,25 @@ class AgentRuntime:
         )
         return None
 
+    async def after_tool(
+        self, tool: BaseTool, args: dict, tool_context: ToolContext, tool_response: dict
+    ) -> dict | None:
+        if tool.name == "create_extension" and tool_response.get("team_run_id"):
+            tool_context.actions.skip_summarization = True
+        return None
+
     async def list_resources(self, resource: str = "all") -> dict:
-        """List all/models/jobs/extensions/tools, plus current model and restart status."""
+        """List all/models/jobs/extensions/tools/builds, plus current model and restart status."""
         invocation = self.authorize_tool()
         result: dict = {}
         if resource in {"all", "models"}:
             result["models"] = await self.ollama.models()
         if resource in {"all", "jobs"}:
             result["jobs"] = self.jobs_status(invocation.user_id, invocation.chat_id)
+        if resource == "builds":
+            result["builds"] = await asyncio.to_thread(
+                self.extensions.team.reports, invocation.user_id
+            )
         if resource in {"all", "extensions", "tools"}:
             result["extensions"] = [r.manifest.model_dump() for r in self.extensions.records()]
             result["builtin_tools"] = BASIC_TOOL_DESCRIPTIONS
@@ -234,7 +247,10 @@ class AgentRuntime:
         input_from: str = "",
         permissions: list[str] | None = None,
     ) -> dict:
-        """Create and activate Python ADK agent/subagent or tool from a request.
+        """Build through PM, Analyst/web research, PM approval, Developer, QA and Reviewer.
+
+        Activation requires executed happy/failure/edge tests and reviewer approval.
+        Failures return a saved team report instead of activating unverified code.
 
         kind: tool, agent, subagent. extension_id: unique lowercase Python identifier.
         parent: root or active parent agent ID. model: installed Ollama model or empty for default.
@@ -244,12 +260,20 @@ class AgentRuntime:
         the generator chooses and declares required packages. Installation happens automatically.
         input_from: existing producer tool ID, e.g. word_count; consume its output instead of
         recounting a file. For word_count plots the input is char_frequency, not file_path.
-        permissions: use ["network"] for external APIs; network is otherwise denied.
-        Workspace access is always available. Explicit [] prevents generated network permission.
+        permissions: optional legacy manifest metadata. Network and workspace access are always
+        available, including when permissions is omitted or [].
         Existing ID creates a new version; failed validation leaves the previous version active.
         """
         invocation = self.authorize_tool()
         try:
+            if invocation.deadline is not None:
+                deadline = asyncio.get_running_loop().time() + (
+                    self.settings.extension_team_timeout_seconds
+                    + self.settings.model_timeout_seconds
+                )
+                invocation.deadline.reschedule(
+                    max(invocation.deadline.when() or deadline, deadline)
+                )
             result = await self.extensions.create(
                 request,
                 kind,
@@ -264,6 +288,13 @@ class AgentRuntime:
             result.pop("source", None)
             result["source_command"] = f"/source {extension_id}"
             return result
+        except TeamFailure as exc:
+            return {
+                "error": str(exc),
+                "status": "not_activated",
+                "team_run_id": exc.report["id"],
+                "report_command": "/build " + exc.report["id"],
+            }
         except (BotError, ValueError) as exc:
             return {"error": str(exc)[:2000], "status": "not_activated"}
 
@@ -312,6 +343,7 @@ class AgentRuntime:
                     tools=[*self.basic_tools.functions, *child_tools(manifest.id)],
                     before_model_callback=self.before_model,
                     before_tool_callback=self.before_tool,
+                    after_tool_callback=self.after_tool,
                     disallow_transfer_to_parent=True,
                     disallow_transfer_to_peers=True,
                 )
@@ -347,9 +379,9 @@ class AgentRuntime:
                 "Для файлів використовуй list_files, read_file, write_file, create_directory, "
                 "delete_file: шляхи відносні до FILESYSTEM_ROOT. "
                 "Для пошуку в інтернеті використовуй search_web і посилайся на URL джерел. "
-                "Для extensions із зовнішніми API передавай permissions=['network'] "
-                "до create_extension: без цього мережа sandbox заблокована. "
-                "Не трактуй помилку DNS як доведений збій серверу; спершу перевір дозволи. "
+                "Усі extensions мають доступ до інтернету й DNS за замовчуванням; "
+                "permissions=['network'] не потрібен. Для HTTP-запитів завжди задавай таймаут. "
+                "Не трактуй помилку DNS як доведений збій серверу без перевірки з’єднання. "
                 "Не повідомляй вигадані нульові вимірювання при помилці API. "
                 "Для SQLite використовуй list_databases, create_database, database_schema, "
                 "table_schema, execute_sql та execute_sql_script. state і session доступні "
@@ -377,6 +409,7 @@ class AgentRuntime:
             ],
             before_model_callback=self.before_model,
             before_tool_callback=self.before_tool,
+            after_tool_callback=self.after_tool,
         )
 
     async def run(self, user_id: int, chat_id: int, job_id: int, text: str) -> str:
@@ -407,7 +440,8 @@ class AgentRuntime:
             )
             answer = []
             progress = TaskProgress()
-            async with asyncio.timeout(self.settings.task_timeout_seconds):
+            async with asyncio.timeout(self.settings.task_timeout_seconds) as deadline:
+                current_invocation.get().deadline = deadline
                 async for event in runner.run_async(
                     user_id=str(user_id),
                     session_id=session_id,
@@ -423,6 +457,8 @@ class AgentRuntime:
                         ]
                         if final_parts:
                             answer = final_parts
+            if progress.team_result is not None:
+                return progress.team_summary()
             if not answer:
                 return progress.missing_answer()
             return "\n".join(answer)

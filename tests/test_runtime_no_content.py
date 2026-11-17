@@ -99,3 +99,34 @@ async def test_no_content_without_tool_outcomes_is_an_explicit_error():
 
     with pytest.raises(BotError, match="Підтверджених результатів інструментів немає"):
         TaskProgress().missing_answer()
+
+
+async def test_team_result_is_reported_without_model_summary(components, monkeypatch):
+    runtime, _, _, _ = components
+    monkeypatch.setattr(runtime.ollama, "require_model", AsyncMock())
+    outcome = response(
+        "create_extension",
+        {
+            "status": "active",
+            "manifest": {"id": "plotter", "version": 1},
+            "team_run_id": "a" * 32,
+            "qa": {"tests_run": 3},
+            "usage": "Use plotter",
+            "report_command": "/build " + "a" * 32,
+        },
+    )
+    calls = []
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        async def run_async(self, **kwargs):
+            calls.append(kwargs)
+            yield outcome
+
+    monkeypatch.setattr("t_bot.runtime.Runner", FakeRunner)
+    result = await runtime.run(1, 5, 1, "Create plotter")
+    assert "Створено plotter v1" in result and "QA: 3" in result
+    assert "/build " in result and "MODEL_RETURNED_NO_CONTENT" not in result
+    assert len(calls) == 1

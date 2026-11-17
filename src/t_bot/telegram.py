@@ -216,6 +216,16 @@ class TelegramAdapter:
         if command in {"/start", "/help"}:
             self.store.audit(user_id, "help.read", "")
             return render_help(r.manifest for r in self.extensions.records())
+        if command == "/builds":
+            reports = await asyncio.to_thread(self.extensions.team.reports, user_id)
+            return (
+                json.dumps(reports, ensure_ascii=False, indent=2) if reports else "Конвеєрів немає."
+            )
+        if command == "/build":
+            if len(args) != 1:
+                raise BotError("/build BUILD_ID")
+            report = await asyncio.to_thread(self.extensions.team.report, args[0], user_id)
+            return json.dumps(report, ensure_ascii=False, indent=2)
         if command == "/time":
             self.store.audit(user_id, "clock.read", self.settings.bot_timezone)
             return format_datetime(current_datetime(self.settings.bot_timezone))

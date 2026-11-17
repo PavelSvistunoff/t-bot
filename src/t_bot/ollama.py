@@ -42,6 +42,8 @@ class Ollama:
         model: str,
         instruction: str,
         schema: dict | None = None,
+        *,
+        max_output_tokens: int = 4096,
     ) -> str:
         await self.require_model(model)
         data = await self.request(
@@ -53,7 +55,7 @@ class Ollama:
                 "think": False,
                 "format": schema or "json",
                 "messages": [{"role": "user", "content": instruction}],
-                "options": {"temperature": 0.1, "num_ctx": 16384, "num_predict": 4096},
+                "options": {"temperature": 0.1, "num_ctx": 16384, "num_predict": max_output_tokens},
             },
         )
         content = data.get("message", {}).get("content", "")

@@ -35,6 +35,9 @@ async def run_worker(settings: Settings) -> int:
         runtime.screenshot_sender = adapter.send_screenshot
         runtime.file_sender = adapter.send_file
         try:
+            await extensions.team.recover(
+                {(r.manifest.id, r.manifest.version): r.digest for r in extensions.records()}
+            )
             jobs.start()
             await adapter.start()
             # A missing model leaves commands available so the operator can select another one.

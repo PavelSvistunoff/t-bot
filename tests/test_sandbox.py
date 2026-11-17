@@ -21,13 +21,16 @@ def tool_manifest(**kwargs):
     )
 
 
-async def run_code(settings, tmp_path, code, **kwargs):
+async def run_code(settings, tmp_path, code, *, omit_permissions=False, **kwargs):
     directory = tmp_path / "code"
     directory.mkdir(exist_ok=True)
     (directory / "extension.py").write_text(code)
+    manifest = tool_manifest(**kwargs).model_dump()
+    if omit_permissions:
+        manifest.pop("permissions")
     return await Sandbox(settings).execute(
         directory,
-        tool_manifest(**kwargs).model_dump(),
+        manifest,
         "invoke",
         {},
     )
@@ -47,7 +50,7 @@ async def test_probe_and_real_tool(settings, tmp_path):
 
 
 @pytest.mark.parametrize("permissions", [[], ["workspace"]])
-async def test_secret_files_environment_network_and_fork_denied(
+async def test_secrets_and_fork_denied_while_network_is_available(
     settings, tmp_path, monkeypatch, permissions
 ):
     secret = tmp_path / "secret.txt"
@@ -83,7 +86,7 @@ def invoke(payload: dict) -> dict:
     return result
 '''
         result = await run_code(settings, tmp_path, code, permissions=permissions)
-    assert result == {"token": None, "file": "denied", "network": "denied", "fork": "denied"}
+    assert result == {"token": None, "file": "denied", "network": "allowed", "fork": "denied"}
 
 
 async def test_timeout_terminates_process(settings, tmp_path):
@@ -312,10 +315,8 @@ def invoke(payload: dict) -> dict:
     assert (settings.filesystem_root / "result.txt").read_text() == "3"
 
 
-@pytest.mark.parametrize("permissions,connected", [([], False), (["network"], True)])
-async def test_network_permission_allows_dns_and_connection_but_not_fork(
-    settings, tmp_path, permissions, connected
-):
+@pytest.mark.parametrize("permissions", [None, [], ["workspace"], ["network"]])
+async def test_network_available_by_default_but_fork_denied(settings, tmp_path, permissions):
     import asyncio
 
     async def reply(reader, writer):
@@ -332,7 +333,7 @@ async def test_network_permission_allows_dns_and_connection_but_not_fork(
     code = f'''import os, socket
 
 def invoke(payload: dict) -> dict:
-    """Probe opt-in network access without granting process creation."""
+    """Probe default network access without granting process creation."""
     try:
         socket.getaddrinfo("localhost", {port})
         with socket.create_connection(("127.0.0.1", {port}), timeout=2) as connection:
@@ -351,7 +352,13 @@ def invoke(payload: dict) -> dict:
     return {{"connected": connected, "fork": fork}}
 '''
     async with server:
-        assert await run_code(settings, tmp_path, code, permissions=permissions) == {
-            "connected": connected,
+        assert await run_code(
+            settings,
+            tmp_path,
+            code,
+            permissions=permissions or [],
+            omit_permissions=permissions is None,
+        ) == {
+            "connected": True,
             "fork": False,
         }

@@ -28,7 +28,16 @@ async def test_supervisor_restarts_a_real_child_process(settings, monkeypatch, t
 
 
 async def test_backup_contains_state_sessions_and_extensions(settings, store, components, tmp_path):
-    runtime, _, _, _ = components
+    runtime, extensions, _, _ = components
+    report = {
+        "id": "b" * 32,
+        "user_id": 1,
+        "extension_id": "example",
+        "status": "failed",
+        "stage": "PM",
+        "error": "Offline",
+    }
+    await extensions.team.save(report)
     store.set("model:root", "other-model")
     await runtime.sessions.create_session(app_name="t_bot", user_id="1", session_id="saved")
     backup_path = tmp_path / "snapshot"
@@ -38,5 +47,6 @@ async def test_backup_contains_state_sessions_and_extensions(settings, store, co
         assert copied.get("model:root") == "other-model"
         assert (backup_path / "sessions.sqlite3").is_file()
         assert (backup_path / "extensions").is_dir()
+        assert (backup_path / "team_runs" / report["id"] / "report.json").is_file()
     finally:
         copied.close()

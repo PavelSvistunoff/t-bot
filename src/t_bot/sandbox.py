@@ -189,12 +189,14 @@ class Sandbox:
                         folders.remove(name)
         return hidden
 
-    def command(self, directory: Path, dependencies: Path, *, network: bool = False) -> list[str]:
+    def command(
+        self, directory: Path, dependencies: Path, *, test_workspace: Path | None = None
+    ) -> list[str]:
         worker = str(Path(__file__).with_name("sandbox_worker.py").resolve())
         python = str(Path(sys.executable).absolute())
         reads = self._read_paths(directory, dependencies)
         writable_names = ("tmp",)
-        root = self.workspace_root()
+        root = test_workspace if test_workspace is not None else self.workspace_root()
         if sys.platform == "darwin" and shutil.which("sandbox-exec"):
             literals = " ".join(f"(subpath {json.dumps(str(path))})" for path in reads)
             writable = " ".join(
@@ -230,15 +232,16 @@ class Sandbox:
                 f"(allow file-read* {writable})"
                 f"(allow process-exec {executable_literals})"
             )
-            if network:
-                profile += (
-                    "(allow network*)"
-                    '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))'
-                    '(allow file-read* (literal "/private/etc/hosts") '
-                    '(literal "/private/etc/resolv.conf") (literal "/private/etc/services") '
-                    '(literal "/private/etc/protocols") (literal "/private/etc/ssl/cert.pem") '
-                    '(subpath "/private/etc/ssl/certs"))'
-                )
+            profile += (
+                "(allow network*)"
+                '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))'
+                '(allow file-read* (literal "/private/etc/hosts") '
+                '(literal "/private/etc/resolv.conf") (literal "/private/etc/services") '
+                '(literal "/private/etc/protocols") (literal "/private/etc/ssl/cert.pem") '
+                '(subpath "/private/etc/ssl/certs"))'
+            )
+            if test_workspace is not None:
+                profile += "(deny network*)"
             components = "|".join(re.escape(name) for name in sorted(BLOCKED_COMPONENTS))
             private_pattern = (
                 "^" + re.escape(str(root)) + "/(.*/)?(" + components + "|\\.env[^/]*)(/|$)"
@@ -265,19 +268,15 @@ class Sandbox:
                 "--tmpfs",
                 "/tmp",
             ]
-            if network:
+            if test_workspace is None:
                 command += ["--share-net"]
-            network_files = (
-                [
-                    Path("/etc/resolv.conf"),
-                    Path("/etc/hosts"),
-                    Path("/etc/nsswitch.conf"),
-                    Path("/etc/ssl/certs"),
-                    Path("/etc/ssl/cert.pem"),
-                ]
-                if network
-                else []
-            )
+            network_files = [
+                Path("/etc/resolv.conf"),
+                Path("/etc/hosts"),
+                Path("/etc/nsswitch.conf"),
+                Path("/etc/ssl/certs"),
+                Path("/etc/ssl/cert.pem"),
+            ]
             for path in [Path("/usr"), Path("/lib"), Path("/lib64"), *reads, *network_files]:
                 if path.exists():
                     command += ["--ro-bind", str(path), str(path)]
@@ -354,9 +353,15 @@ class Sandbox:
         with tempfile.TemporaryDirectory(prefix="t-bot-isolated-") as temporary:
             isolated = await asyncio.to_thread(Path(temporary).resolve)
             (isolated / "tmp").mkdir()
-            root = await asyncio.to_thread(self.workspace_root)
+            if action == "test":
+                root = isolated / "qa_workspace"
+                root.mkdir()
+            else:
+                root = await asyncio.to_thread(self.workspace_root)
             if directory:
                 shutil.copyfile(directory / "extension.py", isolated / "extension.py")
+                if action == "test":
+                    shutil.copyfile(directory / "tests.py", isolated / "tests.py")
             request = {
                 "action": action,
                 "manifest": manifest,
@@ -376,7 +381,7 @@ class Sandbox:
                         self.command,
                         isolated,
                         self.dependency_path(dependencies),
-                        network="network" in manifest.get("permissions", []),
+                        test_workspace=root if action == "test" else None,
                     ),
                     input_data=data,
                     timeout_seconds=self.settings.sandbox_timeout_seconds,

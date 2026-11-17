@@ -28,7 +28,7 @@ class Manifest(BaseModel):
     model: str = "gemma4:12b"
     parent: str = "root"
     dependencies: list[str] = Field(default_factory=list, max_length=64)
-    permissions: list[Literal["workspace", "network"]] = Field(default=["workspace"])
+    permissions: list[Literal["workspace", "network"]] = Field(default=["workspace", "network"])
     input_schema: dict = Field(
         default_factory=lambda: {
             "type": "object",

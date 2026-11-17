@@ -356,3 +356,23 @@ async def test_real_model_requests_screenshot_and_sends_it_to_origin_chat(
     photo.assert_awaited_once()
     assert photo.call_args.kwargs["chat_id"] == 777
     assert photo.call_args.kwargs["photo"].input_file_content == png
+
+
+@pytest.mark.skipif(os.environ.get("RUN_TEAM_TESTS") != "1", reason="Set RUN_TEAM_TESTS=1")
+async def test_real_extension_team_creates_tested_tool(components, settings):
+    _, extensions, _, _ = components
+    settings.extension_team_timeout_seconds = 600
+    result = await extensions.create(
+        "Create a tool doubling integer number, returning doubled. "
+        "Reject bool and strings with ValueError; cover zero and negatives. No dependencies.",
+        "tool",
+        "live_team_doubler",
+        "root",
+        settings.default_model,
+        1,
+        dependencies=[],
+    )
+    assert result["status"] == "active" and result["qa"]["passed"]
+    assert result["qa"]["tests_run"] >= 3 and result["review"]["decision"] == "approve"
+    record = extensions.get("live_team_doubler")
+    assert await extensions.invoke(record, {"number": -3}, 1) == {"doubled": -6}

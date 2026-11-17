@@ -4,11 +4,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from t_bot.extension_team import TeamFailure
 from t_bot.manifest import Manifest
 
 
 @pytest.mark.parametrize("permissions,generated", [(["network"], []), ([], ["network"])])
-async def test_explicit_network_policy_is_authoritative(
+async def test_legacy_permissions_metadata_is_preserved(
     components, monkeypatch, permissions, generated
 ):
     _, extensions, _, _ = components
@@ -30,10 +31,11 @@ async def test_explicit_network_policy_is_authoritative(
     )
     monkeypatch.setattr(extensions.ollama, "generate", generate)
 
-    async def install(candidate, source, user_id):
+    async def install(candidate, source, user_id, **kwargs):
         return SimpleNamespace(manifest=candidate)
 
     monkeypatch.setattr(extensions, "install", install)
+    monkeypatch.setattr(extensions, "validate_source", AsyncMock(return_value={}))
     result = await extensions.create(
         "Weather",
         "tool",
@@ -53,6 +55,7 @@ async def test_unknown_permission_is_rejected_before_generation(components, monk
     _, extensions, _, _ = components
     generate = AsyncMock()
     monkeypatch.setattr(extensions.ollama, "generate", generate)
-    with pytest.raises(ValueError):
+    with pytest.raises(TeamFailure) as failed:
         await extensions.create("Weather", "tool", "weather", "root", "", 1, permissions=["shell"])
     generate.assert_not_awaited()
+    assert extensions.team.report(failed.value.report["id"], 1)["stage"] == "preparation"

@@ -11,6 +11,7 @@ from t_bot.errors import BotError
 class TaskProgress:
     outcomes: list[str] = field(default_factory=list)
     failures: dict[str, str] = field(default_factory=dict)
+    team_result: dict | None = None
 
     def observe(self, event: Event) -> None:
         for part in (event.content.parts or []) if event.content else []:
@@ -19,6 +20,8 @@ class TaskProgress:
                 continue
             data = response.response or {}
             name = response.name or "інструмент"
+            if name == "create_extension" and data.get("team_run_id"):
+                self.team_result = data
             error = data.get("error")
             if error:
                 # Show an actionable error, never model thoughts or an entire subprocess traceback.
@@ -47,6 +50,30 @@ class TaskProgress:
                 )
             elif name == "send_file" and data.get("status") == "sent":
                 self.outcomes.append("Файл надіслано: " + str(data.get("filename", "")))
+
+    def team_summary(self) -> str:
+        """Produce a factual final answer without another model call after the team finishes."""
+        if self.team_result is None:
+            raise BotError("Результату команди ще немає.")
+        result = self.team_result
+        command = result.get("report_command", "/build " + result["team_run_id"])
+        if result.get("status") != "active":
+            raise BotError(
+                "Розширення не активовано. "
+                + str(result.get("error", ""))
+                + "\nЗбережений звіт: "
+                + command
+            )
+        manifest = result["manifest"]
+        return (
+            f"Створено {manifest['id']} v{manifest['version']}. "
+            f"QA: {result.get('qa', {}).get('tests_run', 0)} тестів пройдено; "
+            "Code reviewer схвалив реалізацію.\n"
+            + str(result.get("usage", ""))
+            + "\nЗвіт команди: "
+            + command
+            + "\nРозширення доступне з наступного повідомлення."
+        )
 
     def missing_answer(self) -> str:
         text = "Модель завершила роботу без текстової відповіді (MODEL_RETURNED_NO_CONTENT)."

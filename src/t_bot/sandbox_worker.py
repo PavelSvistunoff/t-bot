@@ -25,6 +25,7 @@ def load_module(directory: str):
     if spec is None or spec.loader is None:
         raise ValueError("Cannot load extension")
     module = importlib.util.module_from_spec(spec)
+    sys.modules["extension"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -56,11 +57,70 @@ def agent_spec(agent, manifest: dict) -> dict:
     return {"name": agent.name, "description": agent.description, "instruction": agent.instruction}
 
 
+def run_tests(directory: str) -> dict:
+    """Run QA's unittest suite; require executable happy/failure/edge assertions."""
+    import ast
+    import io
+    import unittest
+
+    path = Path(directory) / "tests.py"
+    source = path.read_text()
+    tree = ast.parse(source)
+    assertions = sum(
+        isinstance(node, ast.Assert)
+        or (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr.startswith("assert")
+        )
+        for node in ast.walk(tree)
+    )
+    spec = importlib.util.spec_from_file_location("extension_tests", path)
+    if spec is None or spec.loader is None:
+        raise ValueError("Cannot load QA tests")
+    tests = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tests)
+    suite = unittest.defaultTestLoader.loadTestsFromModule(tests)
+
+    def test_ids(node):
+        if isinstance(node, unittest.TestSuite):
+            return [item for child in node for item in test_ids(child)]
+        return [node.id()]
+
+    identifiers = test_ids(suite)
+    coverage = {
+        category: any(".test_" + category + "_" in name for name in identifiers)
+        for category in ("happy", "failure", "edge")
+    }
+    if not all(coverage.values()) or assertions < 3 or not 3 <= len(identifiers) <= 100:
+        return {
+            "passed": False,
+            "target": "qa",
+            "coverage": coverage,
+            "tests_run": 0,
+            "feedback": "Require 3..100 unittest tests, real assertions and test_happy_*, "
+            "test_failure_*, test_edge_* methods.",
+        }
+    output = io.StringIO()
+    result = unittest.TextTestRunner(stream=output, verbosity=1).run(suite)
+    return {
+        "passed": result.wasSuccessful() and not result.skipped and not result.expectedFailures,
+        "tests_run": result.testsRun,
+        "coverage": coverage,
+        "failures": [text[-4000:] for _, text in result.failures[:10]],
+        "errors": [text[-4000:] for _, text in result.errors[:10]],
+        "skipped": len(result.skipped),
+        "output": output.getvalue()[-8000:],
+    }
+
+
 async def run(request: dict) -> dict:
     if request["action"] == "probe":
         return {"ready": True}
     manifest = request["manifest"]
     module = load_module(request["directory"])
+    if request["action"] == "test":
+        return run_tests(request["directory"])
     function = getattr(module, manifest["entrypoint"])
     if manifest["kind"] != "tool":
         agent = function(manifest["model"], "http://127.0.0.1:11434")

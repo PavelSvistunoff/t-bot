@@ -36,12 +36,66 @@ def store(settings):
 
 
 @pytest.fixture
-async def components(settings, store):
+async def components(settings, store, monkeypatch, request):
     ollama = Ollama(settings.ollama_base_url)
     sandbox = Sandbox(settings)
     extensions = Extensions(settings, store, sandbox, ollama)
     control = RestartControl(settings, store, asyncio.Event())
     runtime = AgentRuntime(settings, store, ollama, extensions, control)
+    if not request.node.get_closest_marker("live") and not request.node.get_closest_marker("team"):
+        # Existing contract tests mock only Developer's generator. Keep other role outputs
+        # deterministic; dedicated team tests exercise planning, feedback and QA behavior.
+        import json
+
+        from t_bot.extension_team import SPEC_SCHEMA
+
+        original = extensions.team.roles.ask
+
+        async def other_roles(role, model, context, schema):
+            if role == "Developer":
+                return await original(role, model, context, schema)
+            if role == "Reviewer" or (role == "QA" and "decision" in schema.get("properties", {})):
+                return {"decision": "approve", "findings": []}
+            if role == "QA":
+                candidate = json.loads(context)["implementation"]
+                manifest = candidate["manifest"]
+                source = """import unittest
+import jsonschema
+import extension
+
+class ContractTests(unittest.TestCase):
+    def test_happy_example(self):
+        self.assertTrue(callable(getattr(extension, ENTRYPOINT)))
+    def test_failure_schema(self):
+        with self.assertRaises(jsonschema.ValidationError):
+            jsonschema.validate([], INPUT_SCHEMA)
+    def test_edge_contract(self):
+        self.assertIsInstance(EXAMPLE, dict)
+"""
+                source = source.replace("ENTRYPOINT", repr(manifest["entrypoint"]))
+                source = source.replace("INPUT_SCHEMA", repr(manifest["input_schema"]))
+                source = source.replace("EXAMPLE", repr(manifest["example"]))
+                return {
+                    "tests": source,
+                    "notes": "Deterministic role fixture for host contract tests.",
+                }
+            if "queries" in schema.get("properties", {}):
+                return {"queries": ["Python official documentation"]}
+            return {
+                name: "Objective" if name == "objective" else ["Acceptance"]
+                for name in SPEC_SCHEMA["required"]
+            }
+
+        monkeypatch.setattr(extensions.team.roles, "ask", other_roles)
+        monkeypatch.setattr(
+            extensions.team.web,
+            "search",
+            lambda *args: {
+                "results": [
+                    {"title": "Python", "url": "https://docs.python.org/3/", "snippet": "Docs"}
+                ]
+            },
+        )
     yield runtime, extensions, sandbox, control
     await runtime.close()
     await ollama.close()

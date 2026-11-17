@@ -8,13 +8,15 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import jsonschema
-from pydantic import BaseModel, Field, TypeAdapter, ValidationError
+from pydantic import BaseModel, Field, TypeAdapter
 
 from t_bot.config import Settings
 from t_bot.dependencies import validate_requests
 from t_bot.errors import BotError
+from t_bot.extension_team import ExtensionTeam, TeamFailure
 from t_bot.manifest import Manifest
 from t_bot.ollama import Ollama
 from t_bot.sandbox import Sandbox
@@ -58,6 +60,7 @@ class Extensions:
         self.sandbox = sandbox
         self.ollama = ollama
         self.lock = asyncio.Lock()
+        self.team = ExtensionTeam(settings, ollama)
 
     def records(self, *, active_only: bool = True) -> list[ExtensionRecord]:
         query = "SELECT manifest, active FROM extensions WHERE deleted=0"
@@ -140,7 +143,9 @@ class Extensions:
         except (SyntaxError, ValueError, jsonschema.SchemaError) as exc:
             raise BotError(f"Некоректний контракт розширення: {str(exc)[:500]}") from exc
 
-    async def install(self, manifest: Manifest, source: str, user_id: int) -> ExtensionRecord:
+    async def install(
+        self, manifest: Manifest, source: str, user_id: int, *, tests: str = ""
+    ) -> ExtensionRecord:
         self.settings.authorize(user_id)
         async with self.lock:
             if manifest.version != self.next_version(manifest.id):
@@ -165,6 +170,8 @@ class Extensions:
                 self.check_graph(
                     [r for r in self.records() if r.manifest.id != manifest.id] + [record]
                 )
+                if tests:
+                    (staging / "tests.py").write_text(tests)
                 (staging / "manifest.json").write_text(manifest.model_dump_json(indent=2))
                 await asyncio.to_thread(staging.rename, target)
             with self.store.transaction() as db:
@@ -244,6 +251,48 @@ class Extensions:
         input_from: str = "",
         permissions: list[str] | None = None,
     ) -> dict:
+        """Build through the team and persist failures even before planning can begin."""
+        self.settings.authorize(user_id)
+        try:
+            return await self._create(
+                request,
+                kind,
+                extension_id,
+                parent,
+                model,
+                user_id,
+                dependencies,
+                input_from,
+                permissions,
+            )
+        except TeamFailure:
+            raise
+        except (BotError, ValueError, OSError, TimeoutError) as exc:
+            report = {
+                "id": uuid4().hex,
+                "user_id": user_id,
+                "extension_id": extension_id,
+                "request": request,
+                "status": "failed",
+                "stage": "preparation",
+                "error": str(exc)[-2000:] or type(exc).__name__,
+                "events": [],
+            }
+            await self.team.save(report)
+            raise TeamFailure(report) from exc
+
+    async def _create(
+        self,
+        request: str,
+        kind: str,
+        extension_id: str,
+        parent: str,
+        model: str,
+        user_id: int,
+        dependencies: list[str] | None = None,
+        input_from: str = "",
+        permissions: list[str] | None = None,
+    ) -> dict:
         self.settings.authorize(user_id)
         model = model or self.store.get("model:root", self.settings.default_model)
         base = Manifest(
@@ -257,7 +306,7 @@ class Extensions:
             example_usage=request[:2000],
             dependencies=[],
             permissions=TypeAdapter(list[Literal["workspace", "network"]]).validate_python(
-                permissions if permissions is not None else ["workspace"]
+                permissions if permissions is not None else ["workspace", "network"]
             ),
         )
         if dependencies is not None:
@@ -327,9 +376,8 @@ class Extensions:
             "Agents: build_agent(model: str, api_base: str) returns LlmAgent with LiteLlm "
             "ollama_chat/model. Only name, description, instruction, model constructor fields. "
             "No callbacks, sub_agents or tools in source; relationships are supplied by manifest. "
-            "Host files outside the workspace are forbidden. Network is disabled by default. "
-            "For tools fetching external APIs declare permissions=['network']. "
-            "Workspace is implicit. "
+            "Host files outside the workspace are forbidden. All extensions have network and DNS "
+            "access by default, even without permissions=['network'] or with permissions=[]. "
             "Always set a finite HTTP timeout and handle failures explicitly; never report fake "
             "zero measurements as successful data. Use the real API field names. "
             "All extensions have persistent workspace access by default, even with permissions=[]. "
@@ -362,8 +410,8 @@ class Extensions:
         if input_contract is not None:
             for key in ("input_schema", "example"):
                 schema["properties"]["manifest"]["properties"][key] = {"const": getattr(base, key)}
-        try:
-            generated = json.loads(await self.ollama.generate(model, prompt, schema))
+
+        async def validate_candidate(generated: dict) -> dict:
             if permissions is not None:
                 generated["manifest"]["permissions"] = base.permissions
             if input_contract is not None:
@@ -376,24 +424,82 @@ class Extensions:
             fixed = ("id", "kind", "version", "parent", "model", "entrypoint")
             if any(getattr(candidate, field) != getattr(base, field) for field in fixed):
                 raise BotError("Генератор змінив обов’язкові поля маніфесту.")
-            record = await self.install(candidate, generated["source"], user_id)
-            return {
-                "status": "active",
-                "manifest": record.manifest.model_dump(),
-                "source": generated["source"],
-                "validation": "passed",
-                "usage": candidate.example_usage,
-                "input_from": producer.manifest.id if producer is not None else "",
-                "pipeline": {
-                    "producer": producer.manifest.id,
-                    "consumer": candidate.id,
-                    "input_field": "char_frequency",
-                    "delivery_tool": "send_file",
-                }
-                if producer is not None and input_contract is not None
-                else None,
+            with tempfile.TemporaryDirectory(prefix="team-validate-") as temporary:
+                await self.validate_source(candidate, generated["source"], Path(temporary))
+            return {"manifest": candidate.model_dump(), "source": generated["source"]}
+
+        async def execute_tests(generated: dict, tests: str) -> dict:
+            candidate = Manifest.model_validate(generated["manifest"])
+            try:
+                if len(tests.encode()) > 32000:
+                    raise BotError("QA-тести перевищують 32000 байтів.")
+                try:
+                    ast.parse(tests)
+                except SyntaxError as exc:
+                    return {
+                        "passed": False,
+                        "target": "qa",
+                        "feedback": f"Некоректний Python tests.py: {exc.msg}, рядок {exc.lineno}",
+                    }
+                with tempfile.TemporaryDirectory(prefix="team-qa-") as temporary:
+                    directory = Path(temporary)
+                    (directory / "extension.py").write_text(generated["source"])
+                    (directory / "tests.py").write_text(tests)
+                    return await self.sandbox.execute(directory, candidate.model_dump(), "test", {})
+            except (BotError, ValueError, OSError) as exc:
+                return {"passed": False, "target": "qa", "feedback": str(exc)[-4000:]}
+
+        build = await self.team.run(
+            request=request,
+            extension_id=extension_id,
+            user_id=user_id,
+            model=model,
+            developer_context=prompt,
+            developer_schema=schema,
+            validate=validate_candidate,
+            execute_tests=execute_tests,
+        )
+        generated = build["candidate"]
+        candidate = Manifest.model_validate(generated["manifest"])
+        try:
+            record = await self.install(
+                candidate, generated["source"], user_id, tests=build["tests"]
+            )
+        except asyncio.CancelledError:
+            report = self.team.report(build["team_run_id"], user_id)
+            report.update(status="cancelled", stage="activation", error="Активацію скасовано.")
+            await self.team.save(report)
+            raise
+        except (BotError, ValueError, OSError) as exc:
+            report = self.team.report(build["team_run_id"], user_id)
+            report.update(status="failed", stage="activation", error=str(exc)[-2000:])
+            await self.team.save(report)
+            raise TeamFailure(report) from exc
+        report = self.team.report(build["team_run_id"], user_id)
+        report.update(
+            status="active",
+            stage="completed",
+            version=record.manifest.version,
+            candidate={"manifest": record.manifest.model_dump(), "source": generated["source"]},
+        )
+        await self.team.save(report)
+        return {
+            "status": "active",
+            "manifest": record.manifest.model_dump(),
+            "source": generated["source"],
+            "validation": "passed",
+            "usage": candidate.example_usage,
+            "team_run_id": build["team_run_id"],
+            "report_command": "/build " + build["team_run_id"],
+            "qa": build["qa"],
+            "review": build["review"],
+            "input_from": producer.manifest.id if producer is not None else "",
+            "pipeline": {
+                "producer": producer.manifest.id,
+                "consumer": candidate.id,
+                "input_field": "char_frequency",
+                "delivery_tool": "send_file",
             }
-        except (ValueError, KeyError, TypeError, ValidationError) as exc:
-            raise BotError(
-                "Генератор повернув некоректний код або маніфест; нічого не активовано."
-            ) from exc
+            if producer is not None and input_contract is not None
+            else None,
+        }

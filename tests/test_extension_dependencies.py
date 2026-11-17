@@ -114,9 +114,10 @@ async def test_omitted_dependencies_allow_generation_but_empty_list_is_authorita
     )
     monkeypatch.setattr(extensions.ollama, "generate", generate)
 
-    async def install(candidate, source, user_id):
+    async def install(candidate, source, user_id, **kwargs):
         return SimpleNamespace(manifest=candidate)
 
     monkeypatch.setattr(extensions, "install", install)
+    monkeypatch.setattr(extensions, "validate_source", AsyncMock(return_value={}))
     result = await extensions.create("Test", "tool", "generated", "root", "", 1, dependencies)
     assert result["manifest"]["dependencies"] == expected
