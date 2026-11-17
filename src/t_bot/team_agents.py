@@ -42,10 +42,15 @@ ROLE_INSTRUCTIONS = {
     "No Markdown, code fences, bold markers or prose. Write 3 to 8 focused tests, "
     "keep test source under 10000 characters. Do not call sys.exit or unittest.main. "
     "Avoid real network and destructive workspace writes. "
+    "Verify expected numbers using independent trusted references, not guessed constants. "
+    "Python 5++2 is valid; math trigonometry uses radians. Do not assert exact error wording "
+    "unless required. Return pm for contradictory specifications, qa for test defects. "
     "If a failure reveals an implementation bug, explain it instead of weakening the assertions.",
     "Reviewer": "You are an independent code reviewer. Inspect implementation, tests and actual "
     "execution results against the approved task and Clean Code. Approve only meaningful tests "
     "and correct behavior. Return developer for code defects or qa for weak/broken tests. "
+    "Route requirement contradictions to pm. Do not assume tests are correct because they fail. "
+    "Check numerical oracles independently and avoid exact error prose unless required. "
     "Give precise actionable findings. Do not claim success from a model's statement alone.",
 }
 

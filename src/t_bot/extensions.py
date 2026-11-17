@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from t_bot.config import Settings
 from t_bot.dependencies import validate_requests
+from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
 from t_bot.errors import BotError
 from t_bot.extension_team import ExtensionTeam, TeamFailure
 from t_bot.manifest import Manifest
@@ -250,9 +251,12 @@ class Extensions:
         dependencies: list[str] | None = None,
         input_from: str = "",
         permissions: list[str] | None = None,
+        progress: ProgressCallback | None = None,
     ) -> dict:
         """Build through the team and persist failures even before planning can begin."""
         self.settings.authorize(user_id)
+        reporter = ProgressReporter(progress)
+        reporter.emit(DevelopmentEvent("preparation", "started"))
         try:
             return await self._create(
                 request,
@@ -264,11 +268,12 @@ class Extensions:
                 dependencies,
                 input_from,
                 permissions,
+                progress,
             )
         except TeamFailure:
             raise
         except (BotError, ValueError, OSError, TimeoutError) as exc:
-            report = {
+            report: dict = {
                 "id": uuid4().hex,
                 "user_id": user_id,
                 "extension_id": extension_id,
@@ -279,6 +284,14 @@ class Extensions:
                 "events": [],
             }
             await self.team.save(report)
+            reporter.emit(
+                DevelopmentEvent(
+                    "preparation",
+                    "failed",
+                    report["id"],
+                    detail="Причину збережено у звіті конвеєра.",
+                )
+            )
             raise TeamFailure(report) from exc
 
     async def _create(
@@ -292,9 +305,11 @@ class Extensions:
         dependencies: list[str] | None = None,
         input_from: str = "",
         permissions: list[str] | None = None,
+        progress: ProgressCallback | None = None,
     ) -> dict:
         self.settings.authorize(user_id)
         model = model or self.store.get("model:root", self.settings.default_model)
+        reporter = ProgressReporter(progress)
         base = Manifest.model_validate(
             {
                 "id": extension_id,
@@ -311,7 +326,10 @@ class Extensions:
         )
         if dependencies is not None:
             requests = validate_requests(dependencies)
-            pins = await self.sandbox.prepare_dependencies(requests)
+            pins = await reporter.wait(
+                self.sandbox.prepare_dependencies(requests),
+                DevelopmentEvent("preparation", "running"),
+            )
             base = base.model_copy(update={"dependencies": pins})
         producer = self.get(input_from) if input_from else None
         if producer is None:
@@ -386,7 +404,8 @@ class Extensions:
             "file paths with workspace/; paths are relative to FILESYSTEM_ROOT itself. "
             "Use TMPDIR for temporary files. Validation runs the example: "
             "keep it safe and avoid modifying existing user files. "
-            "No dependencies unless explicitly needed; "
+            "Standard-library modules (math, json, typing, sys, pathlib) are already built in; "
+            "never add them to pip dependencies. No dependencies unless explicitly needed; "
             f"{dependency_policy}{explicit_dependencies}{producer_context}"
             f"Base manifest: {base.model_dump_json()}. Template:\n{template}\n"
             f"User request: {request}"
@@ -449,6 +468,7 @@ class Extensions:
             except (BotError, ValueError, OSError) as exc:
                 return {"passed": False, "target": "qa", "feedback": str(exc)[-4000:]}
 
+        reporter.emit(DevelopmentEvent("preparation", "completed"))
         build = await self.team.run(
             request=request,
             extension_id=extension_id,
@@ -458,22 +478,27 @@ class Extensions:
             developer_schema=schema,
             validate=validate_candidate,
             execute_tests=execute_tests,
+            progress=progress,
         )
         generated = build["candidate"]
         candidate = Manifest.model_validate(generated["manifest"])
+        reporter.emit(DevelopmentEvent("activation", "started", build["team_run_id"]))
         try:
-            record = await self.install(
-                candidate, generated["source"], user_id, tests=build["tests"]
+            record = await reporter.wait(
+                self.install(candidate, generated["source"], user_id, tests=build["tests"]),
+                DevelopmentEvent("activation", "running", build["team_run_id"]),
             )
         except asyncio.CancelledError:
             report = self.team.report(build["team_run_id"], user_id)
             report.update(status="cancelled", stage="activation", error="Активацію скасовано.")
             await self.team.save(report)
+            reporter.emit(DevelopmentEvent("activation", "cancelled", build["team_run_id"]))
             raise
         except (BotError, ValueError, OSError) as exc:
             report = self.team.report(build["team_run_id"], user_id)
             report.update(status="failed", stage="activation", error=str(exc)[-2000:])
             await self.team.save(report)
+            reporter.emit(DevelopmentEvent("activation", "failed", build["team_run_id"]))
             raise TeamFailure(report) from exc
         report = self.team.report(build["team_run_id"], user_id)
         report.update(
@@ -483,6 +508,14 @@ class Extensions:
             candidate={"manifest": record.manifest.model_dump(), "source": generated["source"]},
         )
         await self.team.save(report)
+        reporter.emit(
+            DevelopmentEvent(
+                "activation",
+                "completed",
+                build["team_run_id"],
+                detail=f"Активовано версію {record.manifest.version}.",
+            )
+        )
         return {
             "status": "active",
             "manifest": record.manifest.model_dump(),

@@ -1,6 +1,7 @@
 """Persistent, bounded PM/Analyst/Developer/QA/Reviewer extension workflow."""
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -10,8 +11,10 @@ from pathlib import Path
 from uuid import uuid4
 
 from t_bot.config import Settings
+from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
 from t_bot.errors import BotError
 from t_bot.ollama import Ollama
+from t_bot.qa_expectations import StagnationGuard, audit_specification, audit_tests
 from t_bot.team_agents import RoleAgents
 from t_bot.web_search import WebSearch
 
@@ -75,7 +78,7 @@ QA_SCHEMA = {
 REVIEW_SCHEMA = {
     "type": "object",
     "properties": {
-        "decision": {"enum": ["approve", "developer", "qa"]},
+        "decision": {"enum": ["approve", "developer", "qa", "pm"]},
         "findings": {
             "type": "array",
             "maxItems": 20,
@@ -84,6 +87,10 @@ REVIEW_SCHEMA = {
     },
     "required": ["decision", "findings"],
 }
+
+
+TEST_REVIEW_SCHEMA: dict = copy.deepcopy(REVIEW_SCHEMA)
+TEST_REVIEW_SCHEMA["properties"]["decision"] = {"enum": ["approve", "qa", "pm"]}
 
 
 class TeamFailure(BotError):
@@ -192,6 +199,7 @@ class ExtensionTeam:
         developer_schema: dict,
         validate: Callable[[dict], Awaitable[dict]],
         execute_tests: Callable[[dict, str], Awaitable[dict]],
+        progress: ProgressCallback | None = None,
     ) -> dict:
         self.settings.authorize(user_id)
         report: dict = {
@@ -205,13 +213,15 @@ class ExtensionTeam:
             "calls": 0,
         }
         await self.save(report)
+        reporter = ProgressReporter(progress)
+        reporter.emit(DevelopmentEvent("pipeline", "started", report["id"]))
 
         async def record(stage: str, data: dict) -> None:
             report["stage"] = stage
             report["events"].append({"stage": stage, "data": data})
             await self.save(report)
 
-        async def ask(role: str, context: str, schema: dict) -> dict:
+        async def ask(role: str, context: str, schema: dict, phase: str) -> dict:
             errors: list[str] = []
             models = [
                 model,
@@ -224,6 +234,15 @@ class ExtensionTeam:
                 report["calls"] += 1
                 report["stage"] = role
                 await self.save(report)
+                event = DevelopmentEvent(
+                    phase,
+                    "started",
+                    report["id"],
+                    selected,
+                    attempt + 1,
+                    self.settings.extension_team_stage_attempts,
+                )
+                reporter.emit(event)
                 try:
                     async with asyncio.timeout(self.settings.model_timeout_seconds):
                         retry_feedback = (
@@ -231,12 +250,33 @@ class ExtensionTeam:
                             if errors
                             else ""
                         )
-                        result = await self.roles.ask(
-                            role, selected, context + retry_feedback, schema
+                        result = await reporter.wait(
+                            self.roles.ask(role, selected, context + retry_feedback, schema), event
                         )
                     await record(role, {"model": selected, "output": result})
+                    detail = ""
+                    if "decision" in result:
+                        decision = {
+                            "approve": "Схвалено.",
+                            "developer": "Потрібні правки Developer.",
+                            "qa": "Потрібні правки QA.",
+                            "pm": "Потрібне уточнення ТЗ від PM.",
+                        }
+                        detail = decision.get(result["decision"], "")
+                    reporter.emit(DevelopmentEvent(phase, "completed", report["id"], detail=detail))
                     return result
                 except (BotError, ValueError, TimeoutError) as exc:
+                    reporter.emit(
+                        DevelopmentEvent(
+                            phase,
+                            "failed",
+                            report["id"],
+                            selected,
+                            attempt + 1,
+                            self.settings.extension_team_stage_attempts,
+                            "Причину збережено у звіті конвеєра.",
+                        )
+                    )
                     errors.append(str(exc)[:1000] or type(exc).__name__)
                     await record(
                         role,
@@ -261,6 +301,20 @@ class ExtensionTeam:
                             pass  # Keep retrying the primary model if discovery is unavailable.
             raise BotError(f"{role}: усі спроби завершилися помилкою. {errors[-1]}")
 
+        guard = StagnationGuard(self.settings.extension_team_stagnation_limit)
+
+        async def checked_route(evidence: dict, proposed: str) -> str:
+            escalation = guard.observe(evidence, proposed)
+            if escalation is None:
+                return proposed
+            await record("Stagnation", escalation)
+            if escalation["stop"]:
+                raise BotError(
+                    "Зациклення: повторюються однакові помилки після перегляду QA та PM. "
+                    "Останній валідний кандидат і всі спроби збережено."
+                )
+            return escalation["target"]
+
         try:
             async with asyncio.timeout(self.settings.extension_team_timeout_seconds):
                 draft = await ask(
@@ -270,12 +324,15 @@ class ExtensionTeam:
                     + "\nHOST CONTRACT AND CONSTRAINTS:\n"
                     + developer_context,
                     SPEC_SCHEMA,
+                    "pm_draft",
                 )
                 plan = await ask(
                     "Analyst",
                     "Plan official documentation searches:\n" + json.dumps(draft),
                     QUERY_SCHEMA,
+                    "analyst_plan",
                 )
+                reporter.emit(DevelopmentEvent("research", "started", report["id"]))
                 research = []
                 for query in plan["queries"]:
                     try:
@@ -286,10 +343,22 @@ class ExtensionTeam:
                     except (BotError, OSError) as exc:
                         research.append({"query": query, "error": str(exc)[:1000]})
                 await record("WebSearch", {"research": research})
+                sources = sum(len(item.get("results", [])) for item in research)
+                reporter.emit(
+                    DevelopmentEvent(
+                        "research",
+                        "completed" if sources else "failed",
+                        report["id"],
+                        detail=f"Знайдено джерел: {sources}.",
+                    )
+                )
                 if not any(item.get("results") for item in research):
                     raise BotError("Аналітик не отримав джерел: вебпошук недоступний або порожній.")
                 analysis = await ask(
-                    "Analyst", json.dumps({"draft": draft, "web_results": research}), SPEC_SCHEMA
+                    "Analyst",
+                    json.dumps({"draft": draft, "web_results": research}),
+                    SPEC_SCHEMA,
+                    "analyst_revision",
                 )
                 final_spec = await ask(
                     "PM",
@@ -302,8 +371,10 @@ class ExtensionTeam:
                         }
                     ),
                     SPEC_SCHEMA,
+                    "pm_final",
                 )
                 report["final_spec"] = final_spec
+                report["spec_revisions"] = [copy.deepcopy(final_spec)]
                 await self.save(report)
                 guidelines = Path.cwd() / "AGENTS.md"
                 clean_code = (
@@ -311,11 +382,46 @@ class ExtensionTeam:
                 )
                 feedback: dict = {}
                 candidate: dict = {}
+                last_valid: dict = {}
                 tests = ""
-                route = "developer"
+                specification_audit = audit_specification(request, final_spec)
+                await record("SpecificationAudit", specification_audit)
+                route = "developer" if specification_audit["passed"] else "pm"
+                feedback = (
+                    {} if specification_audit["passed"] else {"specification": specification_audit}
+                )
                 for iteration in range(self.settings.extension_team_max_rounds):
+                    if route == "pm":
+                        final_spec = await ask(
+                            "PM",
+                            json.dumps(
+                                {
+                                    "instruction": "Repair contradictions in the task or tests. "
+                                    "Keep the original request and requirements. "
+                                    "Never change them to fit bugs. "
+                                    "Use reference evidence. "
+                                    "Unary plus is valid; math uses radians.",
+                                    "user_request": request,
+                                    "current_spec": final_spec,
+                                    "feedback": feedback,
+                                }
+                            ),
+                            SPEC_SCHEMA,
+                            "pm_revision",
+                        )
+                        report["final_spec"] = final_spec
+                        report["spec_revisions"].append(copy.deepcopy(final_spec))
+                        await self.save(report)
+                        specification_audit = audit_specification(request, final_spec)
+                        await record("SpecificationAudit", specification_audit)
+                        if not specification_audit["passed"]:
+                            feedback = {"specification": specification_audit}
+                            route = await checked_route(specification_audit, "pm")
+                            continue
+                        route = "developer"
+                        tests = ""
                     if route == "developer":
-                        candidate = await ask(
+                        proposal = await ask(
                             "Developer",
                             developer_context
                             + "\nFINAL TECHNICAL TASK:\n"
@@ -325,15 +431,37 @@ class ExtensionTeam:
                             + "\nPREVIOUS SOURCE AND FEEDBACK:\n"
                             + json.dumps({"candidate": candidate, "feedback": feedback}),
                             developer_schema,
+                            "developer",
                         )
-                        report["candidate"] = candidate
+                        report["attempt_candidate"] = proposal
                         await self.save(report)
+                        reporter.emit(DevelopmentEvent("validation", "started", report["id"]))
                         try:
-                            candidate = await validate(candidate)
+                            candidate = await validate(proposal)
+                            last_valid = copy.deepcopy(candidate)
+                            report["last_valid_candidate"] = last_valid
+                            report["candidate"] = copy.deepcopy(candidate)
+                            await self.save(report)
                             await record("Validation", {"passed": True})
+                            reporter.emit(DevelopmentEvent("validation", "completed", report["id"]))
                         except (BotError, ValueError, OSError) as exc:
+                            candidate = copy.deepcopy(last_valid)
                             feedback = {"validation_error": str(exc)[-3000:]}
+                            report["candidate"] = candidate or proposal
                             await record("Validation", feedback)
+                            route = await checked_route(feedback, "developer")
+                            if route == "qa":
+                                route = "pm"
+                            reporter.emit(DevelopmentEvent("validation", "failed", report["id"]))
+                            reporter.emit(
+                                DevelopmentEvent(
+                                    "rework",
+                                    "rework",
+                                    report["id"],
+                                    detail=f"Передано {'PM' if route == 'pm' else 'Developer'}. "
+                                    f"Раунд {iteration + 1}.",
+                                )
+                            )
                             continue
                     qa = await ask(
                         "QA",
@@ -346,19 +474,94 @@ class ExtensionTeam:
                             }
                         ),
                         QA_SCHEMA,
+                        "qa_write",
                     )
                     tests = qa["tests"]
                     report["candidate"] = candidate
                     report["tests"] = tests
                     await self.save(report)
+                    expectations = audit_tests(request, final_spec, tests)
+                    await record("QAExpectations", expectations)
+                    if not expectations["passed"]:
+                        feedback = {"expectations": expectations}
+                        route = await checked_route(expectations, expectations["target"])
+                        target = "PM" if route == "pm" else "QA"
+                        await record(
+                            "Rework",
+                            {"target": route, "round": iteration + 1, "feedback": feedback},
+                        )
+                        reporter.emit(
+                            DevelopmentEvent(
+                                "rework",
+                                "rework",
+                                report["id"],
+                                detail=f"Передано {target}: суперечності в очікуваннях тестів.",
+                            )
+                        )
+                        continue
+                    test_review = await ask(
+                        "Reviewer",
+                        json.dumps(
+                            {
+                                "phase": "qa_expectations_review",
+                                "user_request": request,
+                                "spec": final_spec,
+                                "manifest": candidate["manifest"],
+                                "tests": tests,
+                                "trusted_checks": expectations,
+                                "instruction": "Review ONLY test oracles against requirements. "
+                                "Verify numbers and exception contracts independently. "
+                                "Do not require unspecified prose. Route bad tests to qa, "
+                                "spec contradictions to pm. Approval here is NOT code approval.",
+                            }
+                        ),
+                        TEST_REVIEW_SCHEMA,
+                        "qa_expectations",
+                    )
+                    await record("TestReview", test_review)
+                    if test_review["decision"] != "approve":
+                        feedback = {"test_review": test_review}
+                        route = await checked_route(feedback, test_review["decision"])
+                        await record(
+                            "Rework",
+                            {"target": route, "round": iteration + 1, "feedback": feedback},
+                        )
+                        reporter.emit(
+                            DevelopmentEvent(
+                                "rework",
+                                "rework",
+                                report["id"],
+                                detail=f"Передано {'PM' if route == 'pm' else 'QA'}: "
+                                "зауваження до тестів.",
+                            )
+                        )
+                        continue
+                    reporter.emit(DevelopmentEvent("qa_execute", "started", report["id"]))
                     execution = await execute_tests(candidate, tests)
                     await record("QAExecution", execution)
+                    reporter.emit(
+                        DevelopmentEvent(
+                            "qa_execute",
+                            "completed" if execution.get("passed") else "failed",
+                            report["id"],
+                            detail=f"Виконано тестів: {execution.get('tests_run', 0)}.",
+                        )
+                    )
                     if execution.get("target") == "qa":
-                        route = "qa"
+                        route = await checked_route(execution, "qa")
                         feedback = {"execution": execution}
                         await record(
                             "Rework",
                             {"target": route, "round": iteration + 1, "feedback": feedback},
+                        )
+                        reporter.emit(
+                            DevelopmentEvent(
+                                "rework",
+                                "rework",
+                                report["id"],
+                                detail=f"Передано {'PM' if route == 'pm' else 'QA'}. "
+                                f"Раунд {iteration + 1}.",
+                            )
                         )
                         continue
                     triage = await ask(
@@ -371,10 +574,12 @@ class ExtensionTeam:
                                 "tests": tests,
                                 "test_results": execution,
                                 "instruction": "Approve only if tests passed. Route code bugs to "
-                                "developer and test defects to qa; explain findings.",
+                                "developer, test defects to qa, and contradictory requirements "
+                                "to pm; explain findings.",
                             }
                         ),
                         REVIEW_SCHEMA,
+                        "qa_triage",
                     )
                     review = await ask(
                         "Reviewer",
@@ -389,6 +594,7 @@ class ExtensionTeam:
                             }
                         ),
                         REVIEW_SCHEMA,
+                        "reviewer",
                     )
                     feedback = {"execution": execution, "qa": triage, "review": review}
                     if (
@@ -408,13 +614,27 @@ class ExtensionTeam:
                             "review": review,
                             "qa_triage": triage,
                         }
-                    route = review["decision"]
+                    route = (
+                        "pm"
+                        if "pm" in {review["decision"], triage["decision"]}
+                        else review["decision"]
+                    )
                     if route == "approve":
                         route = (
                             triage["decision"] if triage["decision"] != "approve" else "developer"
                         )
+                    route = await checked_route(execution, route)
                     await record(
                         "Rework", {"target": route, "round": iteration + 1, "feedback": feedback}
+                    )
+                    target = {"qa": "QA", "pm": "PM", "developer": "Developer"}[route]
+                    reporter.emit(
+                        DevelopmentEvent(
+                            "rework",
+                            "rework",
+                            report["id"],
+                            detail=f"Передано {target}. Раунд {iteration + 1}.",
+                        )
                     )
                 raise BotError(
                     "Вичерпано раунди доопрацювання; QA або reviewer не підтвердили якість."
@@ -424,6 +644,7 @@ class ExtensionTeam:
                 status="cancelled", error="Конвеєр скасовано; поточні артефакти збережено."
             )
             await self.save(report)
+            reporter.emit(DevelopmentEvent("pipeline", "cancelled", report["id"]))
             raise
         except Exception as exc:
             error = (
@@ -433,4 +654,12 @@ class ExtensionTeam:
             )
             report.update(status="failed", error=error)
             await self.save(report)
+            reporter.emit(
+                DevelopmentEvent(
+                    "pipeline",
+                    "failed",
+                    report["id"],
+                    detail="Роботу зупинено; артефакти та причину збережено.",
+                )
+            )
             raise TeamFailure(report) from exc

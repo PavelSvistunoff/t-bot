@@ -96,6 +96,8 @@ async def test_team_rework_routes_and_real_qa(components, monkeypatch):
                 return {"decision": "approve" if passed else "developer", "findings": []}
             return {"tests": TESTS, "notes": "Positive, invalid type and zero boundary."}
         if role == "Reviewer":
+            if json.loads(context).get("phase") == "qa_expectations_review":
+                return {"decision": "approve", "findings": []}
             counts["reviewer"] += 1
             return {
                 "decision": ["developer", "qa", "approve"][counts["reviewer"] - 1],
@@ -106,7 +108,14 @@ async def test_team_rework_routes_and_real_qa(components, monkeypatch):
         return spec()
 
     monkeypatch.setattr(extensions.team.roles, "ask", ask)
-    result = await extensions.create("Double integers", "tool", "doubler", "root", "", 1)
+    progress = []
+    result = await extensions.create(
+        "Double integers", "tool", "doubler", "root", "", 1, progress=progress.append
+    )
+    assert [event.detail.split(".")[0] for event in progress if event.status == "rework"] == [
+        "Передано Developer",
+        "Передано QA",
+    ]
     assert counts == {"developer": 2, "reviewer": 3}
     assert calls[:4] == ["PM", "Analyst", "Analyst", "PM"]
     assert result["qa"]["passed"] and result["qa"]["tests_run"] == 3
@@ -162,7 +171,7 @@ async def test_team_exhaustion_keeps_artifacts_without_activation(
 async def test_team_fallback_and_restart_recovery(components, settings, monkeypatch):
     runtime, extensions, _, _ = components
     settings.extension_team_fallback_models = ["fallback"]
-    ask = AsyncMock(side_effect=BotError("Ollama offline"))
+    ask = AsyncMock(side_effect=BotError("PRIVATE_PROVIDER_DETAIL"))
     monkeypatch.setattr(extensions.team.roles, "ask", ask)
     token = current_invocation.set(Invocation(1, 5, 123))
     try:
@@ -170,6 +179,9 @@ async def test_team_fallback_and_restart_recovery(components, settings, monkeypa
     finally:
         current_invocation.reset(token)
     assert result["status"] == "not_activated" and result["team_run_id"]
+    notices = [row["text"] for row in runtime.store.connection.execute("SELECT text FROM outbox")]
+    assert any("Спроба 2/2" in text and "fallback" in text for text in notices)
+    assert "не вдалося" in notices[-1] and "PRIVATE_PROVIDER_DETAIL" not in "\n".join(notices)
     assert [c.args[1] for c in ask.call_args_list] == ["gemma4:12b", "fallback"]
     report = extensions.team.report(result["team_run_id"], 1)
     assert report["status"] == "failed" and "PM" in report["error"]
@@ -188,12 +200,16 @@ async def test_team_cancellation_persists_report(components, monkeypatch):
         await asyncio.Event().wait()
 
     monkeypatch.setattr(extensions.team.roles, "ask", ask)
-    task = asyncio.create_task(extensions.create("Double", "tool", "doubler", "root", "", 1))
+    progress = []
+    task = asyncio.create_task(
+        extensions.create("Double", "tool", "doubler", "root", "", 1, progress=progress.append)
+    )
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert extensions.team.reports(1)[0]["status"] == "cancelled"
+    assert progress[-1].status == "cancelled"
 
 
 async def test_roles_run_through_adk():

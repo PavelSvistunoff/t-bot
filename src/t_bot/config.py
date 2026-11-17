@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     extension_team_max_rounds: PositiveInt = 3
     extension_team_stage_attempts: PositiveInt = 2
     extension_team_max_calls: PositiveInt = 24
+    extension_team_stagnation_limit: PositiveInt = 3
     extension_team_fallback_models: list[str] = Field(default_factory=list)
     max_delegation_depth: PositiveInt = 3
     max_context_chars: Annotated[int, Field(ge=4000)] = 48000

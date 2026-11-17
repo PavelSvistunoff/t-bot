@@ -71,3 +71,30 @@ async def test_resolver_cannot_replace_explicitly_pinned_version(
     monkeypatch.setattr("t_bot.sandbox.bounded_process", run)
     with pytest.raises(BotError, match="звіт"):
         await sandbox.prepare_dependencies(["matplotlib==3.8.0"])
+
+
+async def test_standard_library_modules_never_reach_pip(components, monkeypatch, pip_report):
+    from t_bot.manifest import Manifest
+
+    _, _, sandbox, _ = components
+    commands = []
+
+    async def run(command, **kwargs):
+        commands.append(command)
+        pip_report(command, ["six==1.17.0"])
+        return b""
+
+    monkeypatch.setattr("t_bot.sandbox.bounded_process", run)
+    assert await sandbox.prepare_dependencies(["math", "json==3.12", "sys"]) == []
+    assert not commands
+    assert await sandbox.prepare_dependencies(["math", "six==1.17.0"]) == ["six==1.17.0"]
+    assert all("math" not in command for command in commands)
+    manifest = Manifest(
+        id="calculator",
+        kind="tool",
+        version=1,
+        description="Math",
+        example_usage="Calculate",
+        dependencies=["math", "math==3.12.0"],
+    )
+    assert manifest.dependencies == []

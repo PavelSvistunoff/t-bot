@@ -13,6 +13,7 @@ from t_bot.dependencies import validate_requests
 from t_bot.errors import BotError
 from t_bot.filesystem import FileSystem
 from t_bot.help_guide import render_help
+from t_bot.manifest import is_standard_dependency
 from t_bot.sqlite_tools import SQLiteTools
 from t_bot.web_search import WebSearch
 
@@ -97,6 +98,20 @@ class BasicTools:
         try:
             packages = validate_requests(dependencies)
             if not packages:
+                builtins = sorted(
+                    {
+                        item.split("==", 1)[0]
+                        for item in dependencies
+                        if is_standard_dependency(item)
+                    }
+                )
+                if builtins:
+                    return {
+                        "status": "builtin",
+                        "dependencies": [],
+                        "stdlib_modules": builtins,
+                        "usage": "Ці модулі вже входять до Python; pip не потрібен.",
+                    }
                 raise BotError("Укажіть хоча б одну назву бібліотеки або package==version.")
             self.audit(user_id, "dependencies.install", ", ".join(packages))
             packages = await self.dependency_installer(packages)

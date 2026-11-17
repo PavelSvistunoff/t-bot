@@ -24,6 +24,7 @@ from google.genai import types
 from t_bot.basic_tools import BasicTools
 from t_bot.config import Settings
 from t_bot.control import RestartControl
+from t_bot.development_progress import DevelopmentEvent, progress_text
 from t_bot.errors import BotError
 from t_bot.extension_team import TeamFailure
 from t_bot.extensions import ExtensionRecord, Extensions
@@ -265,6 +266,13 @@ class AgentRuntime:
         Existing ID creates a new version; failed validation leaves the previous version active.
         """
         invocation = self.authorize_tool()
+
+        def notify_progress(event: DevelopmentEvent) -> None:
+            self.settings.authorize(invocation.user_id)
+            self.store.notify(
+                invocation.chat_id, progress_text(event, extension_id, invocation.job_id)
+            )
+
         try:
             if invocation.deadline is not None:
                 deadline = asyncio.get_running_loop().time() + (
@@ -284,6 +292,7 @@ class AgentRuntime:
                 dependencies=dependencies,
                 input_from=input_from,
                 permissions=permissions,
+                progress=notify_progress,
             )
             result.pop("source", None)
             result["source_command"] = f"/source {extension_id}"

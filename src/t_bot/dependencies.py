@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 from t_bot.config import Settings
 from t_bot.errors import BotError
-from t_bot.manifest import validate_dependency_list
+from t_bot.manifest import is_standard_dependency, validate_dependency_list
 
 
 def package_name(value: str) -> str:
@@ -20,11 +20,12 @@ def package_name(value: str) -> str:
 
 def validate_requests(values: list[str]) -> list[str]:
     if len(values) > 64 or any(
-        not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*(==[a-zA-Z0-9_.+!-]+)?", value)
+        not is_standard_dependency(value)
+        and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*(==[a-zA-Z0-9_.+!-]+)?", value)
         for value in values
     ):
         raise BotError("Укажіть до 64 назв пакетів або package==version, без URL і pip-параметрів.")
-    return sorted(set(values))
+    return sorted(value for value in set(values) if not is_standard_dependency(value))
 
 
 class DependencyResolver:

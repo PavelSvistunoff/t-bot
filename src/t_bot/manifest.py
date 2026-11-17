@@ -1,5 +1,6 @@
 import json
 import re
+import sys
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -7,10 +8,18 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from t_bot.tool_names import BASIC_TOOL_DESCRIPTIONS
 
 
+def is_standard_dependency(value: str) -> bool:
+    """Recognize runtime standard-library modules, never PyPI package/import aliases."""
+    return value.split("==", 1)[0].split(".", 1)[0].casefold() in {
+        name.casefold() for name in sys.stdlib_module_names
+    }
+
+
 def validate_dependency_list(values: list[str]) -> list[str]:
     """Accept at most 64 pinned packages, without pip options, URLs or local paths."""
     if len(values) > 64:
         raise ValueError("At most 64 dependencies are allowed")
+    values = [value for value in values if not is_standard_dependency(value)]
     for value in values:
         if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*==[a-zA-Z0-9_.+!-]+", value):
             raise ValueError("Dependencies must use package==version without URLs or options")
