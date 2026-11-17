@@ -1,6 +1,8 @@
 """Deterministic checks of test oracles; never execute generated Python in the host."""
 
 import ast
+import copy
+import hashlib
 import json
 import math
 import operator
@@ -78,10 +80,20 @@ def reference_math(expression: str) -> int | float | None:
 
 def python_math_task(request: str) -> bool:
     text = request.casefold()
+    mathematical_expressions = bool(
+        re.search(r"математичн|арифметичн|mathematical|arithmetic", text)
+        and re.search(r"вираз|обчисл|операц|expression|evaluat|calculat", text)
+    )
+    expression_calculation = "обчисл" in text and "вираз" in text
     return (
         ("eval" in text and "math" in text)
         or any(word in text for word in ("calculator", "калькулятор"))
-    ) and not any(unit in text for unit in ("градус", "degrees", "custom grammar"))
+        or mathematical_expressions
+        or expression_calculation
+    ) and not re.search(
+        r"градус|degrees?|custom\s+grammar|(?:власн|нестандартн)\w*\s+грамат",
+        text,
+    )
 
 
 def audit_specification(request: str, spec: dict) -> dict:
@@ -117,7 +129,8 @@ def audit_specification(request: str, spec: dict) -> dict:
                         )
                         continue
                     expected = re.match(
-                        r"\s*(?:поверт\w*|returns?|equals?|дорівню\w*|=)\s+"
+                        r"\s*(?:,\s*(?:інструмент|система|програма)\s+)?"
+                        r"(?:поверт\w*|returns?|equals?|дорівню\w*|=)\s+"
                         r"(-?\d+(?:[.,]\d+)?(?:[eE][+-]?\d+)?)(?![\w,])",
                         case[match.end() :],
                         re.IGNORECASE,
@@ -160,12 +173,104 @@ def _literal(node, values: dict):
         return None
 
 
-def _result_expression(node, results: dict):
+def _math_imports(tree: ast.Module) -> tuple[set[str], dict[str, str]]:
+    modules: set[str] = set()
+    functions = {"abs": "abs"}
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            modules.update(alias.asname or "math" for alias in node.names if alias.name == "math")
+        elif isinstance(node, ast.ImportFrom) and node.module == "math":
+            functions.update(
+                {
+                    alias.asname or alias.name: alias.name
+                    for alias in node.names
+                    if alias.name in FUNCTIONS or alias.name in {"pi", "e"}
+                }
+            )
+    return modules, functions
+
+
+class _OracleNames(ast.NodeTransformer):
+    """Normalize whitelisted math imports and numeric variables, without importing test code."""
+
+    def __init__(self, values: dict, modules: set[str], functions: dict[str, str]):
+        self.values = values
+        self.modules = modules
+        self.functions = functions
+
+    def visit_Name(self, node: ast.Name) -> ast.AST:
+        value = self.values.get(node.id)
+        if type(value) in {int, float}:
+            return ast.Constant(value=value)
+        return ast.Name(id=self.functions.get(node.id, node.id), ctx=ast.Load())
+
+    def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+        if isinstance(node.value, ast.Name) and node.value.id in self.modules:
+            if node.attr in FUNCTIONS or node.attr in {"pi", "e"}:
+                return ast.Name(id=node.attr, ctx=ast.Load())
+        return node
+
+
+def _expected_value(node: ast.AST, values: dict, modules: set[str], functions: dict[str, str]):
+    literal = _literal(node, values)
+    if literal is not None:
+        return literal
+    nodes = list(ast.walk(node))
+    if len(nodes) > 128 or any(
+        isinstance(child, ast.Name)
+        and child.id not in modules
+        and child.id not in functions
+        and type(values.get(child.id)) not in {int, float}
+        for child in nodes
+    ):
+        return None
+    normalized = _OracleNames(values, modules, functions).visit(copy.deepcopy(node))
+    try:
+        return reference_math(ast.unparse(ast.fix_missing_locations(normalized)))
+    except (ValueError, RecursionError):
+        return None
+
+
+def _result_expression(node, results: dict, values: dict):
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "str":
         node = node.args[0] if node.args else None
-    if isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name):
-        return results.get(node.value.id)
+    if isinstance(node, ast.Subscript):
+        return _result_expression(node.value, results, values)
+    if isinstance(node, ast.Name):
+        return results.get(node.id)
+    if isinstance(node, ast.Call) and node.args:
+        function = node.func
+        if (isinstance(function, ast.Name) and function.id == "invoke") or (
+            isinstance(function, ast.Attribute) and function.attr == "invoke"
+        ):
+            payload = _literal(node.args[0], values)
+            if isinstance(payload, dict):
+                return next(
+                    (payload[k] for k in ("expression", "expr", "text") if k in payload), None
+                )
     return None
+
+
+def _numeric_agreement(
+    call: ast.Call, expected: int | float, reference: int | float, values: dict
+) -> bool | None:
+    """Apply unittest numeric assertion semantics, including explicit delta or places."""
+    if not isinstance(call.func, ast.Attribute):
+        return None
+    if expected == reference:
+        return True
+    if call.func.attr == "assertEqual":
+        return False
+    arguments = {item.arg: _literal(item.value, values) for item in call.keywords}
+    delta = arguments.get("delta", _literal(call.args[4], values) if len(call.args) > 4 else None)
+    if delta is not None:
+        return abs(expected - reference) <= delta if type(delta) in {int, float} else None
+    places = arguments.get("places", _literal(call.args[2], values) if len(call.args) > 2 else 7)
+    if places is None:
+        places = 7
+    if type(places) is not int or abs(places) > 308:
+        return None
+    return round(abs(expected - reference), places) == 0
 
 
 def audit_tests(request: str, spec: dict, tests: str) -> dict:
@@ -177,10 +282,12 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
     references = []
     target = "qa"
     tree = ast.parse(tests)
+    imported_modules, imported_functions = _math_imports(tree)
     for method in (n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)):
         values: dict = {}
         results: dict = {}
-        assertions: list[tuple[ast.Call, dict, dict]] = []
+        modules, functions = set(imported_modules), dict(imported_functions)
+        assertions: list[tuple[ast.Call, dict, dict, set[str], dict[str, str]]] = []
         for node in method.body:
             # Branches/loops need independent review; do not merge their variable scopes.
             if not isinstance(node, ast.Assign | ast.Expr):
@@ -191,7 +298,11 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                 and isinstance(node.targets[0], ast.Name)
             ):
                 name = node.targets[0].id
-                literal = _literal(node.value, values)
+                literal = _expected_value(node.value, values, modules, functions)
+                values.pop(name, None)
+                results.pop(name, None)
+                modules.discard(name)
+                functions.pop(name, None)
                 if literal is not None:
                     values[name] = literal
                 if isinstance(node.value, ast.Call) and node.value.args:
@@ -206,32 +317,33 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                             None,
                         )
             assertions.extend(
-                (call, dict(values), dict(results))
+                (call, dict(values), dict(results), set(modules), dict(functions))
                 for call in ast.walk(node)
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
             )
-        for call, values, results in assertions:
+        for call, values, results, modules, functions in assertions:
             if len(call.args) < 2:
                 continue
             if not isinstance(call.func, ast.Attribute):
                 continue
             assertion = call.func.attr
-            actual = _result_expression(call.args[0], results)
-            expected = _literal(call.args[1], values)
+            actual = _result_expression(call.args[0], results, values)
+            expected = _expected_value(call.args[1], values, modules, functions)
             if assertion in {"assertEqual", "assertAlmostEqual"}:
                 if actual is None:
-                    actual = _result_expression(call.args[1], results)
-                    expected = _literal(call.args[0], values)
+                    actual = _result_expression(call.args[1], results, values)
+                    expected = _expected_value(call.args[0], values, modules, functions)
                 if (
                     type(expected) in {int, float}
                     and isinstance(actual, str)
                     and python_math_task(request)
                 ):
                     reference = reference_math(actual)
-                    places = next(
-                        (_literal(k.value, values) for k in call.keywords if k.arg == "places"), 7
+                    agreement = (
+                        _numeric_agreement(call, expected, reference, values)
+                        if reference is not None
+                        else None
                     )
-                    tolerance = 10 ** -max(0, min(15, places if isinstance(places, int) else 7))
                     if reference is not None:
                         references.append(
                             {
@@ -239,11 +351,10 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                                 "expression": actual,
                                 "expected": expected,
                                 "reference": reference,
+                                "matched": agreement,
                             }
                         )
-                    if reference is not None and not math.isclose(
-                        expected, reference, rel_tol=1e-7, abs_tol=tolerance
-                    ):
+                    if agreement is False:
                         if actual in json_text(spec) and str(expected) in json_text(spec):
                             target = "pm"
                         findings.append(
@@ -258,12 +369,17 @@ def audit_tests(request: str, spec: dict, tests: str) -> dict:
                             f"{method.name}: текст помилки {expected!r} не заданий контрактом; "
                             "перевіряйте тип/ознаку помилки, а не довільне формулювання."
                         )
-            if assertion == "assertIn" and isinstance(call.args[0], ast.Constant):
+            if assertion in {"assertIn", "assertNotIn"} and isinstance(call.args[0], ast.Constant):
                 marker = call.args[0].value
-                actual = _result_expression(call.args[1], results)
+                actual = _result_expression(call.args[1], results, values)
                 if (
                     isinstance(marker, str)
-                    and any(s in marker.casefold() for s in ("помил", "error"))
+                    and (
+                        assertion == "assertIn"
+                        and any(s in marker.casefold() for s in ("помил", "error"))
+                        or assertion == "assertNotIn"
+                        and marker == "result"
+                    )
                     and isinstance(actual, str)
                     and python_math_task(request)
                     and reference_math(actual) is not None
@@ -284,6 +400,39 @@ def json_text(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
+def artifact_fingerprint(candidate: dict, tests: str) -> dict[str, str]:
+    """Hash executable syntax and contracts; formatting, comments and review prose are ignored."""
+
+    def code_digest(source: str) -> str:
+        try:
+            normalized = ast.dump(ast.parse(source), include_attributes=False)
+        except (SyntaxError, ValueError, RecursionError):
+            normalized = source.strip()
+        return hashlib.sha256(normalized.encode()).hexdigest()
+
+    manifest = candidate.get("manifest", {})
+    contract = {
+        key: manifest.get(key)
+        for key in (
+            "kind",
+            "entrypoint",
+            "input_schema",
+            "output_schema",
+            "dependencies",
+            "model",
+            "parent",
+            "permissions",
+        )
+    }
+    return {
+        "candidate_digest": code_digest(candidate.get("source", "")),
+        "tests_digest": code_digest(tests),
+        "contract_digest": hashlib.sha256(
+            json.dumps(contract, sort_keys=True).encode()
+        ).hexdigest(),
+    }
+
+
 class StagnationGuard:
     """Escalate repeated failures from Developer to QA, then PM, then stop explicitly."""
 
@@ -292,8 +441,10 @@ class StagnationGuard:
         self.counts: Counter[str] = Counter()
         self.escalations: Counter[str] = Counter()
 
-    def observe(self, evidence: dict, target: str) -> dict | None:
-        if evidence.get("failures") or evidence.get("errors"):
+    def observe(self, evidence: dict, target: str, *, state: dict | None = None) -> dict | None:
+        if state is not None:
+            text = "artifacts:" + json.dumps(state, sort_keys=True)
+        elif evidence.get("failures") or evidence.get("errors"):
             text = json_text(
                 {
                     kind: [
@@ -315,4 +466,10 @@ class StagnationGuard:
         self.escalations[text] += 1
         level = self.escalations[text]
         route = ("qa" if target == "developer" else "pm") if level == 1 else "pm"
-        return {"occurrences": self.counts[text], "target": route, "stop": level >= 3}
+        return {
+            "occurrences": self.counts[text],
+            "target": route,
+            "stop": level >= 3,
+            "basis": "artifacts" if state is not None else "error",
+            "state": state,
+        }

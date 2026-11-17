@@ -14,7 +14,12 @@ from t_bot.config import Settings
 from t_bot.development_progress import DevelopmentEvent, ProgressCallback, ProgressReporter
 from t_bot.errors import BotError
 from t_bot.ollama import Ollama
-from t_bot.qa_expectations import StagnationGuard, audit_specification, audit_tests
+from t_bot.qa_expectations import (
+    StagnationGuard,
+    artifact_fingerprint,
+    audit_specification,
+    audit_tests,
+)
 from t_bot.team_agents import RoleAgents
 from t_bot.web_search import WebSearch
 
@@ -311,8 +316,20 @@ class ExtensionTeam:
 
         guard = StagnationGuard(self.settings.extension_team_stagnation_limit)
 
-        async def checked_route(evidence: dict, proposed: str) -> str:
-            escalation = guard.observe(evidence, proposed)
+        async def checked_route(
+            evidence: dict,
+            proposed: str,
+            *,
+            candidate: dict | None = None,
+            tests: str = "",
+            phase: str = "",
+        ) -> str:
+            state = (
+                {"phase": phase, **artifact_fingerprint(candidate, tests)}
+                if candidate is not None
+                else None
+            )
+            escalation = guard.observe(evidence, proposed, state=state)
             if escalation is None:
                 return proposed
             await record("Stagnation", escalation)
@@ -468,7 +485,12 @@ class ExtensionTeam:
                             feedback = {"validation_error": str(exc)[-3000:]}
                             report["candidate"] = candidate or proposal
                             await record("Validation", feedback)
-                            route = await checked_route(feedback, "developer")
+                            route = await checked_route(
+                                feedback,
+                                "developer",
+                                candidate=proposal,
+                                phase="validation",
+                            )
                             if route == "qa":
                                 route = "pm"
                             reporter.emit(DevelopmentEvent("validation", "failed", report["id"]))
@@ -503,7 +525,13 @@ class ExtensionTeam:
                     await record("QAExpectations", expectations)
                     if not expectations["passed"]:
                         feedback = {"expectations": expectations}
-                        route = await checked_route(expectations, expectations["target"])
+                        route = await checked_route(
+                            expectations,
+                            expectations["target"],
+                            candidate=candidate,
+                            tests=tests,
+                            phase="qa_expectations",
+                        )
                         target = "PM" if route == "pm" else "QA"
                         await record(
                             "Rework",
@@ -531,7 +559,10 @@ class ExtensionTeam:
                                 "instruction": "Review ONLY test oracles against requirements. "
                                 "Verify numbers and exception contracts independently. "
                                 "Do not require unspecified prose. Route bad tests to qa, "
-                                "spec contradictions to pm. Approval here is NOT code approval.",
+                                "spec contradictions to pm. Approval here is NOT code approval. "
+                                "Use trusted_checks as evidence. Do not reject a verified numeric "
+                                "oracle because of rounded comments or hypothetical float errors. "
+                                "Any disputed assertion needs a concrete conflicting reference.",
                             }
                         ),
                         TEST_REVIEW_SCHEMA,
@@ -540,7 +571,13 @@ class ExtensionTeam:
                     await record("TestReview", test_review)
                     if test_review["decision"] != "approve":
                         feedback = {"test_review": test_review}
-                        route = await checked_route(feedback, test_review["decision"])
+                        route = await checked_route(
+                            feedback,
+                            test_review["decision"],
+                            candidate=candidate,
+                            tests=tests,
+                            phase="test_review",
+                        )
                         await record(
                             "Rework",
                             {"target": route, "round": iteration + 1, "feedback": feedback},
@@ -567,7 +604,13 @@ class ExtensionTeam:
                         )
                     )
                     if execution.get("target") == "qa":
-                        route = await checked_route(execution, "qa")
+                        route = await checked_route(
+                            execution,
+                            "qa",
+                            candidate=candidate,
+                            tests=tests,
+                            phase="qa_execution",
+                        )
                         feedback = {"execution": execution}
                         await record(
                             "Rework",
@@ -642,7 +685,13 @@ class ExtensionTeam:
                         route = (
                             triage["decision"] if triage["decision"] != "approve" else "developer"
                         )
-                    route = await checked_route(execution, route)
+                    route = await checked_route(
+                        execution,
+                        route,
+                        candidate=candidate,
+                        tests=tests,
+                        phase="code_review" if execution.get("passed") else "qa_execution",
+                    )
                     await record(
                         "Rework", {"target": route, "round": iteration + 1, "feedback": feedback}
                     )

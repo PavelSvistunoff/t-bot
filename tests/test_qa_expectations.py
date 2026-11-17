@@ -163,3 +163,140 @@ def test_scientific_notation_in_correct_requirement_is_not_truncated():
             "acceptance_criteria": ["'10**5' returns 1e5."],
         },
     )["passed"]
+
+
+@pytest.mark.parametrize(
+    "user_request",
+    [
+        "Створи інструмент для обчислення складних математичних виразів. Використовуй math.",
+        "ОБЧИСЛИ ВИРАЗ 2+2",
+        "Реалізуй арифметичні операції з дужками",
+        "Evaluate mathematical expressions using sin and cos",
+    ],
+)
+def test_ukrainian_and_english_math_intent_without_word_calculator(user_request):
+    audit = audit_specification(
+        user_request,
+        {
+            "happy_path": ["Користувач вводить '2 + 2 * 5', інструмент повертає 15."],
+            "failure_path": ["Невалідний синтаксис: '5 ++ 2'."],
+        },
+    )
+    assert not audit["passed"]
+    assert {c["reference"] for c in audit["corrections"]} == {12, 7}
+
+
+@pytest.mark.parametrize(
+    "user_request",
+    [
+        "Переклади документацію math українською",
+        "Порахуй частоту літер у файлі math.txt",
+        "Калькулятор: тригонометричні функції у градусах",
+        "Обчислюй математичні вирази, використовуючи власну граматику",
+    ],
+)
+def test_unrelated_or_custom_semantics_do_not_enable_python_oracle(user_request):
+    assert audit_specification(user_request, {"failure_path": ["Syntax: '5++2'"]})["passed"]
+
+
+DYNAMIC_TEST = """import math as maths
+from math import cos as cosine
+
+class Tests:
+    def test_happy_expression(self):
+        payload = {"text": "7+5+sin(7)-1+cos(5)"}
+        response = invoke(payload)
+        base = 7 + 5
+        expected = base + maths.sin(7) - 1 + cosine(5)
+        self.assertAlmostEqual(response["result"], expected, places=5)
+"""
+
+
+def test_dynamic_math_oracle_is_verified_with_import_aliases_and_variables():
+    audit = audit_tests("Обчисли математичний вираз", {}, DYNAMIC_TEST)
+    assert audit["passed"]
+    assert audit["reference_checks"][0]["matched"] is True
+    assert audit["reference_checks"][0]["expected"] == 11.940648784182015
+    wrong = DYNAMIC_TEST.replace("base = 7 + 5", "base = 7 + 6")
+    audit = audit_tests("Обчисли математичний вираз", {}, wrong)
+    assert not audit["passed"] and audit["target"] == "qa"
+    assert audit["reference_checks"][0]["matched"] is False
+
+
+def test_dynamic_inline_oracle_and_direct_invocation():
+    tests = """import math
+class Tests:
+    def test_happy(self):
+        self.assertAlmostEqual(invoke({"text": "sqrt(16)"})["result"], math.sqrt(16))
+"""
+    audit = audit_tests(REQUEST, {}, tests)
+    assert audit["passed"] and audit["reference_checks"][0]["matched"]
+
+
+def test_delta_is_respected_when_verifying_rounded_expected_number():
+    tests = DYNAMIC_TEST.replace("base + maths.sin(7) - 1 + cosine(5)", "11.94").replace(
+        "places=5", "delta=0.01"
+    )
+    assert audit_tests(REQUEST, {}, tests)["passed"]
+    assert not audit_tests(REQUEST, {}, tests.replace("delta=0.01", "delta=0.00001"))["passed"]
+
+
+def test_valid_expression_cannot_be_expected_to_return_error_dictionary():
+    tests = """class Tests:
+    def test_failure(self):
+        response = invoke({"text": "5 ++ 2"})
+        self.assertIn("error", response)
+        self.assertNotIn("result", response)
+"""
+    audit = audit_tests("Інструмент обчислення математичних виразів", {}, tests)
+    assert not audit["passed"] and audit["target"] == "qa"
+
+
+def test_unknown_reassignment_does_not_reuse_stale_numeric_oracle(tmp_path):
+    marker = tmp_path / "not-created"
+    tests = DYNAMIC_TEST.replace("expected = base", "expected = 123\n        expected = base")
+    tests = tests.replace(
+        "base + maths.sin(7) - 1 + cosine(5)",
+        f"__import__('pathlib').Path({str(marker)!r}).write_text('bad')",
+    )
+    audit = audit_tests(REQUEST, {}, tests)
+    assert not audit["reference_checks"]
+    assert not marker.exists()
+
+
+def test_artifact_loop_ignores_review_prose_comments_and_whitespace():
+    from t_bot.qa_expectations import artifact_fingerprint
+
+    guard = StagnationGuard(limit=2)
+    routes = []
+    for i in range(6):
+        candidate = {"source": f"# Attempt {i}\ndef invoke(payload):\n    return 1\n"}
+        tests = f"# Retry {i}\ndef test_happy():\n    assert 1 == 1\n"
+        state = {"phase": "test_review", **artifact_fingerprint(candidate, tests)}
+        outcome = guard.observe({"findings": [f"Different wording {i}"]}, "qa", state=state)
+        if outcome:
+            routes.append(outcome)
+    assert [item["target"] for item in routes] == ["pm", "pm", "pm"]
+    assert routes[-1]["stop"] and routes[-1]["basis"] == "artifacts"
+
+
+def test_changed_code_tests_or_contract_count_as_distinct_progress():
+    from t_bot.qa_expectations import artifact_fingerprint
+
+    guard = StagnationGuard(limit=2)
+    candidate = {"source": "def invoke(payload):\n    return 1", "manifest": {}}
+    base = artifact_fingerprint(candidate, "assert 1")
+    states = [
+        base,
+        artifact_fingerprint(
+            {**candidate, "source": "def invoke(payload):\n    return 2"}, "assert 1"
+        ),
+        artifact_fingerprint(candidate, "assert 2"),
+        artifact_fingerprint(
+            {**candidate, "manifest": {"output_schema": {"type": "number"}}}, "assert 1"
+        ),
+    ]
+    assert len({str(state) for state in states}) == 4
+    assert all(
+        guard.observe({"error": "same prose"}, "developer", state=state) is None for state in states
+    )

@@ -345,3 +345,107 @@ async def test_pm_semantic_failure_uses_fallback_instead_of_repeating_report_loo
         event["stage"] == "PM" and "ТЗ не виправлено" in event["data"].get("error", "")
         for event in report["events"]
     )
+
+
+async def test_rephrased_reviewer_cannot_loop_on_unchanged_code_and_tests(
+    components,
+    settings,
+    monkeypatch,
+):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    settings.extension_team_max_rounds = 30
+    settings.extension_team_max_calls = 100
+    settings.extension_team_stagnation_limit = 2
+    reviews = []
+
+    async def ask(role, model, context, schema):
+        if role == "Developer":
+            return candidate()
+        if "queries" in schema["properties"]:
+            return {"queries": ["Python math documentation"]}
+        if "tests" in schema["properties"]:
+            tests = "import math\n" + TESTS.replace(
+                "EXPECTED", "7 + 5 + math.sin(7) - 1 + math.cos(5)"
+            )
+            return {"tests": f"# Retry {len(reviews)}\n" + tests, "notes": "Math oracles"}
+        if "decision" in schema["properties"]:
+            data = json.loads(context)
+            assert data["phase"] == "qa_expectations_review"
+            assert all(item["matched"] for item in data["trusted_checks"]["reference_checks"])
+            reviews.append(f"Reworded precision concern {len(reviews)}")
+            return {"decision": "qa", "findings": [reviews[-1]]}
+        return spec()
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    execute = AsyncMock()
+    with pytest.raises(TeamFailure) as failed:
+        await extensions.team.run(
+            request="Створи інструмент для обчислення складних математичних виразів через math.",
+            extension_id="calc_repair",
+            user_id=1,
+            model="fake",
+            developer_context="Implement",
+            developer_schema={},
+            validate=AsyncMock(side_effect=lambda value: value),
+            execute_tests=execute,
+        )
+    report = failed.value.report
+    assert "Зациклення" in report["error"]
+    assert len(reviews) == len(set(reviews)) == 6
+    assert report["last_valid_candidate"]["source"] == SOURCE
+    assert execute.await_count == 0
+    stagnation = [event["data"] for event in report["events"] if event["stage"] == "Stagnation"]
+    assert all(event["basis"] == "artifacts" for event in stagnation)
+    assert {event["state"]["phase"] for event in stagnation} == {"test_review"}
+    assert [event["target"] for event in stagnation] == ["pm", "pm", "pm"]
+    assert stagnation[-1]["stop"]
+
+
+@pytest.mark.sandbox
+async def test_ukrainian_spec_and_dynamic_oracle_repairs_activate_valid_candidate(
+    components,
+    monkeypatch,
+):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    bad = spec()
+    bad["happy_path"] = ["Користувач вводить '2 + 2 * 5', інструмент повертає 15."]
+    bad["failure_path"] = ["Невалідний синтаксис '5 ++ 2' повертає помилку."]
+    good = copy.deepcopy(bad)
+    good["happy_path"][0] = good["happy_path"][0].replace("15", "12")
+    good["failure_path"][0] = good["failure_path"][0].replace("5 ++ 2", "5+*2")
+    counts = {"developer": 0, "qa": 0, "pm_revision": 0}
+
+    async def ask(role, model, context, schema):
+        if role == "PM":
+            if "current_spec" in context:
+                counts["pm_revision"] += 1
+                return copy.deepcopy(good)
+            return copy.deepcopy(bad)
+        if "queries" in schema["properties"]:
+            return {"queries": ["Python math documentation"]}
+        if role == "Analyst":
+            return copy.deepcopy(bad)
+        if role == "Developer":
+            counts["developer"] += 1
+            return candidate()
+        if "tests" in schema["properties"]:
+            counts["qa"] += 1
+            expected = "7 + 5 + math.sin(7) - 1 + math.cos(5)"
+            if counts["qa"] == 1:
+                expected += " + 1"
+            return {"tests": "import math\n" + TESTS.replace("EXPECTED", expected), "notes": "Math"}
+        return {"decision": "approve", "findings": []}
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    result = await extensions.create(
+        "Створи інструмент для обчислення складних математичних виразів із функціями math.",
+        "tool",
+        "calc_repair",
+        "root",
+        "",
+        1,
+    )
+    assert result["status"] == "active" and result["qa"]["tests_run"] == 3
+    assert counts == {"developer": 1, "qa": 2, "pm_revision": 1}
