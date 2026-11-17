@@ -19,6 +19,8 @@ FUNCTIONS = {
         "exp",
     )
 }
+FUNCTIONS["abs"] = abs
+
 OPERATORS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,
@@ -77,28 +79,76 @@ def reference_math(expression: str) -> int | float | None:
 def python_math_task(request: str) -> bool:
     text = request.casefold()
     return (
-        "eval" in text
-        and "math" in text
-        and not any(unit in text for unit in ("градус", "degrees", "custom grammar"))
-    )
+        ("eval" in text and "math" in text)
+        or any(word in text for word in ("calculator", "калькулятор"))
+    ) and not any(unit in text for unit in ("градус", "degrees", "custom grammar"))
 
 
 def audit_specification(request: str, spec: dict) -> dict:
+    """Locate independently verifiable contradictions before implementation or QA."""
     findings = []
+    corrections = []
     if python_math_task(request):
-        for case in spec.get("failure_path", []):
-            if not any(word in case.casefold() for word in ("синтакс", "syntax")):
-                continue
-            for expression in re.findall(r"['\"`]([^'\"`]+)['\"`]", case):
-                value = reference_math(expression)
-                if value is not None:
-                    findings.append(
-                        f"ТЗ помилково називає {expression!r} синтаксичною помилкою Python: "
-                        f"контрольний AST-обчислювач повертає {value}. "
-                        "Використайте справді некоректний синтаксис, наприклад '5+*2', "
-                        "або явно погодьте окрему граматику з вимогами користувача."
+        for section in ("requirements", "acceptance_criteria", "happy_path", "failure_path"):
+            for index, case in enumerate(spec.get(section, [])):
+                for match in re.finditer(r"['\"`]([^'\"`]+)['\"`]", case):
+                    expression = match.group(1)
+                    value = reference_math(expression)
+                    if value is None:
+                        continue
+                    location = f"{section}[{index}]"
+                    if section == "failure_path" and any(
+                        word in case.casefold() for word in ("синтакс", "syntax")
+                    ):
+                        findings.append(
+                            f"{location}: {expression!r} є валідним виразом зі значенням {value}, "
+                            "а не синтаксичною помилкою. Виправте саме цей пункт, "
+                            "замінивши приклад на справді невалідний '5+*2'."
+                        )
+                        corrections.append(
+                            {
+                                "section": section,
+                                "index": index,
+                                "original": case,
+                                "suggested": case[: match.start(1)] + "5+*2" + case[match.end(1) :],
+                                "expression": expression,
+                                "reference": value,
+                            }
+                        )
+                        continue
+                    expected = re.match(
+                        r"\s*(?:поверт\w*|returns?|equals?|дорівню\w*|=)\s+"
+                        r"(-?\d+(?:[.,]\d+)?(?:[eE][+-]?\d+)?)(?![\w,])",
+                        case[match.end() :],
+                        re.IGNORECASE,
                     )
-    return {"passed": not findings, "target": "pm", "findings": findings}
+                    if expected is None:
+                        continue
+                    number = float(expected.group(1).replace(",", "."))
+                    if math.isclose(number, value, rel_tol=1e-7, abs_tol=1e-7):
+                        continue
+                    findings.append(
+                        f"{location}: неправильний результат {expression!r}: "
+                        f"задано {number}, контрольний результат {value}."
+                    )
+                    first = match.end() + expected.start(1)
+                    last = match.end() + expected.end(1)
+                    corrections.append(
+                        {
+                            "section": section,
+                            "index": index,
+                            "original": case,
+                            "suggested": case[:first] + str(float(value)) + case[last:],
+                            "expression": expression,
+                            "reference": value,
+                        }
+                    )
+    return {
+        "passed": not findings,
+        "target": "pm",
+        "findings": findings,
+        "corrections": corrections,
+    }
 
 
 def _literal(node, values: dict):

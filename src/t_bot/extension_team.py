@@ -221,7 +221,13 @@ class ExtensionTeam:
             report["events"].append({"stage": stage, "data": data})
             await self.save(report)
 
-        async def ask(role: str, context: str, schema: dict, phase: str) -> dict:
+        async def ask(
+            role: str,
+            context: str,
+            schema: dict,
+            phase: str,
+            check: Callable[[dict], Awaitable[None]] | None = None,
+        ) -> dict:
             errors: list[str] = []
             models = [
                 model,
@@ -254,6 +260,8 @@ class ExtensionTeam:
                             self.roles.ask(role, selected, context + retry_feedback, schema), event
                         )
                     await record(role, {"model": selected, "output": result})
+                    if check is not None:
+                        await check(result)
                     detail = ""
                     if "decision" in result:
                         decision = {
@@ -309,11 +317,25 @@ class ExtensionTeam:
                 return proposed
             await record("Stagnation", escalation)
             if escalation["stop"]:
-                raise BotError(
-                    "Зациклення: повторюються однакові помилки після перегляду QA та PM. "
+                artifacts = (
                     "Останній валідний кандидат і всі спроби збережено."
+                    if report.get("last_valid_candidate")
+                    else "Кандидата ще не створено; ТЗ і всі спроби збережено."
+                )
+                raise BotError(
+                    "Зациклення: повторюються однакові помилки після доопрацювань. " + artifacts
                 )
             return escalation["target"]
+
+        async def check_specification(specification: dict) -> None:
+            audit = audit_specification(request, specification)
+            await record("SpecificationAudit", audit)
+            if not audit["passed"]:
+                raise BotError(
+                    "ТЗ не виправлено. Змініть конкретні пункти з corrections, "
+                    "не додавайте протилежні твердження в інші розділи. "
+                    + json.dumps(audit, ensure_ascii=False)
+                )
 
         try:
             async with asyncio.timeout(self.settings.extension_team_timeout_seconds):
@@ -400,7 +422,9 @@ class ExtensionTeam:
                                     "Keep the original request and requirements. "
                                     "Never change them to fit bugs. "
                                     "Use reference evidence. "
-                                    "Unary plus is valid; math uses radians.",
+                                    "Apply the supplied corrections to the EXACT section/index. "
+                                    "Do not leave the old contradictory example elsewhere. "
+                                    "Preserve unrelated requirements and return the full task.",
                                     "user_request": request,
                                     "current_spec": final_spec,
                                     "feedback": feedback,
@@ -408,16 +432,11 @@ class ExtensionTeam:
                             ),
                             SPEC_SCHEMA,
                             "pm_revision",
+                            check=check_specification,
                         )
                         report["final_spec"] = final_spec
                         report["spec_revisions"].append(copy.deepcopy(final_spec))
                         await self.save(report)
-                        specification_audit = audit_specification(request, final_spec)
-                        await record("SpecificationAudit", specification_audit)
-                        if not specification_audit["passed"]:
-                            feedback = {"specification": specification_audit}
-                            route = await checked_route(specification_audit, "pm")
-                            continue
                         route = "developer"
                         tests = ""
                     if route == "developer":

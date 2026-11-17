@@ -267,3 +267,81 @@ async def test_independent_oracle_review_routes_before_test_execution(
     assert result["qa"]["passed"]
     assert counts == {"developer": developers, "review": 2, "pm_revision": int(target == "pm")}
     assert execute.await_count == 1
+
+
+@pytest.mark.sandbox
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+async def test_pm_semantic_failure_uses_fallback_instead_of_repeating_report_loop(
+    components,
+    settings,
+    monkeypatch,
+    repair_succeeds,
+):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    settings.extension_team_fallback_models = ["qwen3-coder:30b"]
+    revisions = []
+    bad = spec(bad=True)
+    bad["acceptance_criteria"] = ["Вираз 'sqrt(16) + (2 * 3)' повертає 8.0."]
+    good = copy.deepcopy(bad)
+    good["failure_path"] = ["Синтаксична помилка Python: '5+*2'"]
+    good["acceptance_criteria"] = ["Вираз 'sqrt(16) + (2 * 3)' повертає 10.0."]
+
+    async def ask(role, model, context, schema):
+        if role == "PM":
+            if "current_spec" not in context:
+                return copy.deepcopy(bad)
+            revisions.append(model)
+            if len(revisions) == 1:
+                # The report's failure: add a true requirement, leave the false examples intact.
+                result = copy.deepcopy(bad)
+                result["requirements"].append("5++2 is valid and returns 7")
+                return result
+            assert "PREVIOUS ATTEMPT FAILED" in context
+            assert "failure_path[0]" in context
+            assert "corrections" in context and "10.0" in context
+            return copy.deepcopy(good if repair_succeeds else bad)
+        if "queries" in schema["properties"]:
+            return {"queries": ["Python math documentation"]}
+        if role == "Analyst":
+            return copy.deepcopy(bad)
+        if role == "Developer":
+            final_task = context.split("\nFINAL TECHNICAL TASK:\n", 1)[1]
+            final_task = final_task.split("\nREPOSITORY CLEAN CODE RULES:\n", 1)[0]
+            assert json.loads(final_task) == good
+            return candidate()
+        if "tests" in schema["properties"]:
+            return {"tests": TESTS.replace("EXPECTED", "11.940648784182015"), "notes": "Tests"}
+        return {"decision": "approve", "findings": []}
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    arguments = (
+        "Create a scientific calculator supporting sin, cos, sqrt and arithmetic expressions.",
+        "tool",
+        "calc_repair",
+        "root",
+        "",
+        1,
+    )
+    if not repair_succeeds:
+        settings.extension_team_max_rounds = 30
+        with pytest.raises(TeamFailure) as failed:
+            await extensions.create(*arguments)
+        report = failed.value.report
+        assert report["calls"] == 6
+        assert "PM: усі спроби" in report["error"]
+        assert not report.get("candidate")
+        assert not any(event["stage"] == "Developer" for event in report["events"])
+        assert revisions == [settings.default_model, "qwen3-coder:30b"]
+        return
+    result = await extensions.create(*arguments)
+    assert result["status"] == "active" and result["qa"]["passed"]
+    assert revisions == [settings.default_model, "qwen3-coder:30b"]
+    report = extensions.team.report(result["team_run_id"], 1)
+    assert report["final_spec"] == good
+    assert len(report["spec_revisions"]) == 2
+    assert not any(event["stage"] == "Stagnation" for event in report["events"])
+    assert any(
+        event["stage"] == "PM" and "ТЗ не виправлено" in event["data"].get("error", "")
+        for event in report["events"]
+    )

@@ -114,3 +114,52 @@ def test_incorrect_numeric_requirement_is_returned_to_pm():
         tests,
     )
     assert not audit["passed"] and audit["target"] == "pm"
+
+
+@pytest.mark.parametrize(
+    "description",
+    [
+        "Вираз 'sqrt(16) + (2 * 3)' повертає 8.0.",
+        "'sqrt(16) + (2 * 3)' returns 8.0.",
+    ],
+)
+def test_numeric_acceptance_criteria_are_checked_before_developer(description):
+    audit = audit_specification(
+        "Create a scientific calculator",
+        {
+            "acceptance_criteria": [description],
+            "failure_path": ["Синтаксичні помилки: '5++2' або '10 /'."],
+        },
+    )
+    assert not audit["passed"]
+    assert {(c["section"], c["index"]) for c in audit["corrections"]} == {
+        ("acceptance_criteria", 0),
+        ("failure_path", 0),
+    }
+    corrected = {c["section"]: [c["suggested"]] for c in audit["corrections"]}
+    assert "10.0" in corrected["acceptance_criteria"][0]
+    assert "'10 /'" in corrected["failure_path"][0]
+    assert audit_specification("Create a scientific calculator", corrected)["passed"]
+
+
+def test_custom_grammar_is_not_overridden_by_python_math_rules():
+    audit = audit_specification(
+        "Calculator with custom grammar",
+        {
+            "failure_path": ["Syntax error: '5++2'"],
+        },
+    )
+    assert audit["passed"]
+
+
+def test_absolute_value_reference_is_supported():
+    assert reference_math("abs(-7) + sqrt(16)") == 11
+
+
+def test_scientific_notation_in_correct_requirement_is_not_truncated():
+    assert audit_specification(
+        "Scientific calculator",
+        {
+            "acceptance_criteria": ["'10**5' returns 1e5."],
+        },
+    )["passed"]
