@@ -42,6 +42,21 @@ async def components(settings, store, monkeypatch, request):
     extensions = Extensions(settings, store, sandbox, ollama)
     control = RestartControl(settings, store, asyncio.Event())
     runtime = AgentRuntime(settings, store, ollama, extensions, control)
+    if not request.node.get_closest_marker("live"):
+        from unittest.mock import AsyncMock
+
+        monkeypatch.setattr(
+            extensions.team.webpages,
+            "read",
+            AsyncMock(
+                return_value={
+                    "url": "https://docs.python.org/3/",
+                    "title": "Python",
+                    "text": "Official Python documentation",
+                    "truncated": False,
+                }
+            ),
+        )
     if not request.node.get_closest_marker("live") and not request.node.get_closest_marker("team"):
         # Existing contract tests mock only Developer's generator. Keep other role outputs
         # deterministic; dedicated team tests exercise planning, feedback and QA behavior.

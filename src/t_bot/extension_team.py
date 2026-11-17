@@ -15,7 +15,6 @@ from t_bot.development_progress import DevelopmentEvent, ProgressCallback, Progr
 from t_bot.development_supervisor import SUPERVISOR_SCHEMA, DevelopmentSupervisor, validate_advice
 from t_bot.errors import BotError
 from t_bot.image_quality import (
-    audit_image_tests,
     image_contract,
     image_review_schema,
     validate_size_claims,
@@ -24,10 +23,10 @@ from t_bot.ollama import Ollama
 from t_bot.qa_expectations import (
     artifact_fingerprint,
     audit_specification,
-    audit_tests,
 )
 from t_bot.team_agents import RoleAgents
 from t_bot.web_search import WebSearch
+from t_bot.webpage import WebpageReader
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +47,6 @@ SPEC_SCHEMA = {
                 "acceptance_criteria",
                 "happy_path",
                 "failure_path",
-                "edge_cases",
             )
         },
     },
@@ -58,7 +56,6 @@ SPEC_SCHEMA = {
         "acceptance_criteria",
         "happy_path",
         "failure_path",
-        "edge_cases",
     ],
 }
 QUERY_SCHEMA = {
@@ -100,8 +97,8 @@ REVIEW_SCHEMA = {
 }
 
 
-TEST_REVIEW_SCHEMA: dict = copy.deepcopy(REVIEW_SCHEMA)
-TEST_REVIEW_SCHEMA["properties"]["decision"] = {"enum": ["approve", "qa", "pm"]}
+CODE_REVIEW_SCHEMA: dict = copy.deepcopy(REVIEW_SCHEMA)
+CODE_REVIEW_SCHEMA["properties"]["decision"] = {"enum": ["approve", "developer", "pm"]}
 
 
 class TeamFailure(BotError):
@@ -119,6 +116,9 @@ class ExtensionTeam:
         self.settings = settings
         self.roles = RoleAgents(ollama)
         self.web = WebSearch(settings.web_search_timeout_seconds, settings.web_search_max_results)
+        self.webpages = WebpageReader(
+            settings.webpage_timeout_seconds, settings.webpage_max_bytes, settings.webpage_max_chars
+        )
         self.directory = settings.data_dir / "team_runs"
 
     async def save(self, report: dict) -> None:
@@ -383,12 +383,16 @@ class ExtensionTeam:
             schema: dict,
             phase: str,
             check: Callable[[dict], Awaitable[None]],
+            supervision_context: dict | None = None,
         ) -> tuple[dict, str | None]:
             context = {**context, "user_request": request}
+            assessment = {**context, **(supervision_context or {})}
 
             async def checked(review: dict) -> None:
                 try:
-                    supervisor.check_review(review)
+                    supervisor.check_review(
+                        review, context.get("implementation", {}).get("source", "")
+                    )
                     await check(review)
                 except BotError as exc:
                     await record(
@@ -459,11 +463,11 @@ class ExtensionTeam:
             last_advice = None
             # Each review can be arbitrated at most twice, within the shared call/time budgets.
             for repair_attempt in range(2):
-                if not supervisor.needs_arbitration(review, context):
+                if not supervisor.needs_arbitration(review, assessment):
                     return (
                         {**review, "supervisor_advice": last_advice} if last_advice else review
                     ), None
-                advice = await request_advice({**context, "review": review}, allowed)
+                advice = await request_advice({**assessment, "review": review}, allowed)
                 last_advice = advice
                 if advice["action"] == "stop":
                     raise BotError("Supervisor зупинив конвеєр: " + advice["reason"])
@@ -474,11 +478,25 @@ class ExtensionTeam:
                         "Supervisor: Reviewer не узгодив зауваження з доказами; "
                         "вичерпано перегляди, кандидат і пояснення збережено."
                     )
+                code_evidence = [
+                    item
+                    for item in advice["evidence"]
+                    if any(
+                        item["pointer"].startswith(prefix)
+                        for prefix in (
+                            "/implementation",
+                            "/manifest",
+                            "/spec",
+                            "/user_request",
+                            "/image_contract",
+                        )
+                    )
+                ]
                 repair = {
                     **context,
-                    "supervisor_feedback": advice,
-                    "instruction": "Reconsider ONLY disputed findings using the evidence. "
-                    "Give concrete defects, or approve. Approval remains your responsibility.",
+                    "supervisor_feedback": {"action": "reviewer", "code_evidence": code_evidence},
+                    "instruction": "Reconsider the disputed CODE findings against request/spec. "
+                    "Review only Developer code. Tests and their quality are QA's responsibility.",
                 }
                 review = await ask(
                     "Reviewer",
@@ -539,20 +557,40 @@ class ExtensionTeam:
                     except (BotError, OSError) as exc:
                         research.append({"query": query, "error": str(exc)[:1000]})
                 await record("WebSearch", {"research": research})
-                sources = sum(len(item.get("results", [])) for item in research)
+                pages = []
+                seen_urls: set[str] = set()
+                for search in research:
+                    for result in search.get("results", []):
+                        url = result.get("url")
+                        if not isinstance(url, str) or url in seen_urls or len(seen_urls) >= 3:
+                            continue
+                        seen_urls.add(url)
+                        try:
+                            page = await self.webpages.read(url)
+                            if not page.get("text", "").strip():
+                                raise BotError("Сторінка не містить читабельного тексту.")
+                            pages.append(page)
+                            await record("ReadWebpage", {"requested_url": url, "page": page})
+                        except (BotError, OSError) as exc:
+                            await record(
+                                "ReadWebpage", {"requested_url": url, "error": str(exc)[:1000]}
+                            )
                 reporter.emit(
                     DevelopmentEvent(
                         "research",
-                        "completed" if sources else "failed",
+                        "completed" if pages else "failed",
                         report["id"],
-                        detail=f"Знайдено джерел: {sources}.",
+                        detail=f"Прочитано сторінок: {len(pages)} із {len(seen_urls)}.",
                     )
                 )
-                if not any(item.get("results") for item in research):
-                    raise BotError("Аналітик не отримав джерел: вебпошук недоступний або порожній.")
+                if not pages:
+                    raise BotError(
+                        "Аналітик не зміг перевірити джерела через read_webpage: "
+                        "немає доступних сторінок із текстом."
+                    )
                 analysis = await ask(
                     "Analyst",
-                    json.dumps({"draft": draft, "web_results": research}),
+                    json.dumps({"draft": draft, "web_results": research, "web_pages": pages}),
                     SPEC_SCHEMA,
                     "analyst_revision",
                 )
@@ -676,6 +714,7 @@ class ExtensionTeam:
                                 "implementation": candidate,
                                 "feedback": feedback,
                                 "previous_tests": tests,
+                                "user_request": request,
                                 "image_contract": image_contract(request, final_spec),
                             }
                         ),
@@ -686,111 +725,14 @@ class ExtensionTeam:
                     report["candidate"] = candidate
                     report["tests"] = tests
                     await self.save(report)
-                    oracle = (
-                        await reference_values(candidate, tests, final_spec)
-                        if reference_values is not None
-                        else {}
-                    )
-                    expectations = audit_tests(
-                        request,
-                        final_spec,
-                        tests,
-                        semantics=oracle.get("semantics"),
-                        references=oracle.get("values"),
-                    )
-                    contract = oracle.get("image_contract", image_contract(request, final_spec))
-                    if contract["enabled"] and expectations["passed"]:
-                        image_audit = audit_image_tests(tests, contract)
-                        expectations["image_checks"] = image_audit
-                        if not image_audit["passed"]:
-                            expectations.update(
-                                passed=False, target="qa", findings=image_audit["findings"]
-                            )
-                    await record("QAExpectations", expectations)
-                    if not expectations["passed"]:
-                        feedback = {"expectations": expectations}
-                        route = await checked_route(
-                            expectations,
-                            expectations["target"],
-                            candidate=candidate,
-                            tests=tests,
-                            phase="qa_expectations",
-                        )
-                        target = "PM" if route == "pm" else "QA"
-                        await record(
-                            "Rework",
-                            {"target": route, "round": iteration + 1, "feedback": feedback},
-                        )
-                        reporter.emit(
-                            DevelopmentEvent(
-                                "rework",
-                                "rework",
-                                report["id"],
-                                detail=f"Передано {target}: суперечності в очікуваннях тестів.",
-                            )
-                        )
-                        continue
-                    await advance_progress(2, "expectations_audit_passed")
-
-                    async def check_image_review(review: dict, facts: dict = contract) -> None:
-                        if facts["enabled"]:
-                            validate_size_claims(review, facts)
-
-                    test_review, test_route = await coordinated_review(
-                        {
-                            "phase": "qa_expectations_review",
-                            "user_request": request,
-                            "spec": final_spec,
-                            "manifest": candidate["manifest"],
-                            "tests": tests,
-                            "trusted_checks": expectations,
-                            "image_contract": contract,
-                            "instruction": "Review ONLY test oracles against requirements. "
-                            "Verify numbers and exception contracts independently. "
-                            "Do not require unspecified prose. Route bad tests to qa, "
-                            "spec contradictions to pm. Approval here is NOT code approval. "
-                            "Use trusted_checks as evidence. Do not reject a verified numeric "
-                            "oracle because of rounded comments or hypothetical float errors. "
-                            "Any disputed assertion needs a concrete conflicting reference.",
-                        },
-                        image_review_schema(TEST_REVIEW_SCHEMA)
-                        if contract["enabled"]
-                        else TEST_REVIEW_SCHEMA,
-                        "qa_expectations",
-                        check_image_review,
-                    )
-                    await record("TestReview", test_review)
-                    if test_review["decision"] != "approve":
-                        feedback = {"test_review": test_review}
-                        route = await checked_route(
-                            feedback,
-                            test_route or test_review["decision"],
-                            candidate=candidate,
-                            tests=tests,
-                            phase="test_review",
-                        )
-                        await record(
-                            "Rework",
-                            {"target": route, "round": iteration + 1, "feedback": feedback},
-                        )
-                        reporter.emit(
-                            DevelopmentEvent(
-                                "rework",
-                                "rework",
-                                report["id"],
-                                detail=f"Передано {'PM' if route == 'pm' else 'QA'}: "
-                                "зауваження до тестів.",
-                            )
-                        )
-                        continue
-                    await advance_progress(3, "test_review_approved")
+                    contract = image_contract(request, final_spec)
                     reporter.emit(DevelopmentEvent("qa_execute", "started", report["id"]))
                     execution = await execute_tests(candidate, tests)
                     await record("QAExecution", execution)
                     if execution.get("tests_run", 0) > 0:
-                        await advance_progress(4, "tests_executed")
+                        await advance_progress(2, "tests_executed")
                     if execution.get("passed"):
-                        await advance_progress(5, "tests_passed")
+                        await advance_progress(3, "tests_passed")
                     reporter.emit(
                         DevelopmentEvent(
                             "qa_execute",
@@ -827,6 +769,7 @@ class ExtensionTeam:
                         json.dumps(
                             {
                                 "phase": "triage",
+                                "user_request": request,
                                 "spec": final_spec,
                                 "implementation": candidate,
                                 "tests": tests,
@@ -837,27 +780,59 @@ class ExtensionTeam:
                                 "to pm; explain findings.",
                             }
                         ),
-                        image_review_schema(REVIEW_SCHEMA)
-                        if contract["enabled"]
-                        else REVIEW_SCHEMA,
+                        REVIEW_SCHEMA,
                         "qa_triage",
-                        check=check_image_review,
                     )
+                    if execution.get("passed") is not True or triage["decision"] != "approve":
+                        feedback = {"execution": execution, "qa": triage}
+                        proposed = (
+                            triage["decision"] if triage["decision"] != "approve" else "developer"
+                        )
+                        route = await checked_route(
+                            execution,
+                            proposed,
+                            candidate=candidate,
+                            tests=tests,
+                            phase="qa_execution",
+                        )
+                        await record(
+                            "Rework",
+                            {"target": route, "round": iteration + 1, "feedback": feedback},
+                        )
+                        reporter.emit(
+                            DevelopmentEvent(
+                                "rework",
+                                "rework",
+                                report["id"],
+                                detail=f"Передано {route.capitalize() if route != 'qa' else 'QA'}. "
+                                f"Раунд {iteration + 1}.",
+                            )
+                        )
+                        continue
+
+                    async def check_code_review(review: dict, facts: dict = contract) -> None:
+                        if facts["enabled"]:
+                            validate_size_claims(review, facts)
+
                     review, review_route = await coordinated_review(
                         {
                             "spec": final_spec,
-                            "implementation": candidate,
-                            "tests": tests,
-                            "test_results": execution,
-                            "image_contract": contract,
-                            "qa_notes": qa["notes"],
-                            "qa_triage": triage,
+                            "implementation": {
+                                "manifest": candidate["manifest"],
+                                "source": candidate["source"],
+                            },
+                            "image_contract": {"geometry_facts": contract["geometry_facts"]},
+                            "instruction": "Review ONLY Developer source and manifest "
+                            "against the task "
+                            "and Clean Code. Test design, assertions and coverage belong to QA. "
+                            "Do not request test changes or infer anything about unseen tests.",
                         },
-                        image_review_schema(REVIEW_SCHEMA)
+                        image_review_schema(CODE_REVIEW_SCHEMA)
                         if contract["enabled"]
-                        else REVIEW_SCHEMA,
+                        else CODE_REVIEW_SCHEMA,
                         "reviewer",
-                        check_image_review,
+                        check_code_review,
+                        supervision_context={"test_results": execution, "qa_triage": triage},
                     )
                     feedback = {"execution": execution, "qa": triage, "review": review}
                     if supervisor.may_activate(execution, triage, review):

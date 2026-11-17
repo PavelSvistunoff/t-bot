@@ -440,12 +440,12 @@ class Extensions:
             for key in ("input_schema", "example"):
                 schema["properties"]["manifest"]["properties"][key] = {"const": getattr(base, key)}
 
-        async def reference_values(generated: dict, tests: str, spec: dict) -> dict:
+        async def reference_values(generated: dict, _tests: str, spec: dict) -> dict:
             manifest = generated["manifest"]
             semantics = math_semantics(request, manifest)
             oracle = {"semantics": semantics, "values": {}}
             if semantics == "sympy":
-                expressions = math_expressions(tests, spec, manifest.get("example", {}))
+                expressions = math_expressions(spec, manifest.get("example", {}))
                 oracle = await self.sandbox.execute(
                     None, manifest, "reference", {"expressions": expressions}
                 )

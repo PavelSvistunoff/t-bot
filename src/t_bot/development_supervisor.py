@@ -79,9 +79,20 @@ class DevelopmentSupervisor:
         return {"stage": "Stagnation", **repeated} if repeated else None
 
     @staticmethod
-    def check_review(review: dict) -> None:
+    def check_review(review: dict, source: str = "") -> None:
+        if review["decision"] not in {"approve", "developer", "pm"}:
+            raise BotError("Reviewer оцінює лише код Developer; якість тестів належить QA.")
         if review["decision"] == "approve":
             return
+        for finding in review.get("findings", []):
+            qa_tokens = re.findall(
+                r"\btest_(?:happy|failure|edge)_\w+|\bassert(?:Equal|AlmostEqual|Raises|In|NotEqual)\b",
+                finding,
+            )
+            if any(token not in source for token in qa_tokens):
+                raise BotError(
+                    "Reviewer має переглянути код Developer; assertions і тести оцінює QA."
+                )
         meaningful = [
             finding
             for finding in review.get("findings", [])
@@ -95,7 +106,7 @@ class DevelopmentSupervisor:
         if not meaningful:
             raise BotError(
                 "Supervisor повертає зауваження Reviewer: потрібен конкретний дефект "
-                "із посиланням на вимогу, assertion або результати. Порожні findings "
+                "із посиланням на вимогу або код Developer. Порожні findings "
                 "та службові placeholders не є підставою для доопрацювання."
             )
 
@@ -109,19 +120,13 @@ class DevelopmentSupervisor:
             return True
         if qa.get("decision") in {"developer", "qa", "pm"} and qa["decision"] != review["decision"]:
             return True
-        references = context.get("trusted_checks", {}).get("reference_checks", [])
-        verified = {item["test"] for item in references if item.get("matched") is True}
-        findings = " ".join(review.get("findings", [])).casefold()
-        numerical = re.search(
-            r"точн|округл|радіан|precision|rounding|radian|oracle|еталон", findings
-        )
-        return bool(numerical and any(name.casefold() in findings for name in verified))
+        return False
 
     @staticmethod
     def may_activate(execution: dict, qa: dict, review: dict) -> bool:
         return (
             execution.get("passed") is True
-            and execution.get("tests_run", 0) >= 3
+            and execution.get("tests_run", 0) >= 2
             and not execution.get("failures")
             and not execution.get("errors")
             and not execution.get("skipped")

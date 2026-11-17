@@ -1,6 +1,5 @@
 import asyncio
 import io
-import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -10,7 +9,7 @@ from PIL import Image
 from t_bot.errors import BotError
 from t_bot.extension_team import SPEC_SCHEMA, TeamFailure
 from t_bot.filesystem import FileSystem
-from t_bot.image_quality import audit_image_tests, image_contract, validate_size_claims
+from t_bot.image_quality import image_contract, validate_size_claims
 from t_bot.manifest import Manifest
 
 pytestmark = pytest.mark.team
@@ -121,7 +120,7 @@ class CatTests(unittest.TestCase):
     }
     for feature in variants:
         tests += f"""
-    def test_edge_{feature}(self):
+    def test_happy_{feature}(self):
         sampled = []
         for seed in (11, 29, 47):
             random.seed(seed)
@@ -156,7 +155,6 @@ def research(team, monkeypatch):
 
 def test_head_example_does_not_define_canvas_constraint():
     contract = image_contract(REQUEST, specification())
-    assert contract["random_features"] == ["fur", "size", "ears", "eyes", "whiskers"]
     assert contract["geometry_facts"][0]["subject"] == "head"
     assert not contract["geometry_facts"][0]["binding"]
     claim = {"subject": "canvas", "size": [200, 200], "section": "happy_path", "index": 0}
@@ -184,29 +182,6 @@ def test_explicit_canvas_and_example_head_in_same_sentence_stay_separate():
     facts = image_contract(REQUEST, spec)["geometry_facts"]
     assert any(fact["subject"] == "canvas" and fact["binding"] for fact in facts)
     assert all(not fact["binding"] for fact in facts if fact["subject"] == "head")
-
-
-def test_unrelated_words_do_not_invent_random_cat_features():
-    assert (
-        image_contract("Хочу унікальне зображення квітки, a clear image.", {})["random_features"]
-        == []
-    )
-
-
-def test_path_only_tests_do_not_cover_random_features():
-    weak = """class Tests:
-    def test_happy(self):
-        response = invoke({})
-        self.assertTrue(response["file_path"].endswith(".png"))
-"""
-    contract = image_contract(REQUEST, specification())
-    assert len(audit_image_tests(weak, contract)["findings"]) == 5
-    assert audit_image_tests(qa_tests(), contract)["passed"]
-    # Merely reading pixels without asserting anything about them is insufficient.
-    unused = qa_tests().replace(
-        "self.assertNotEqual(pixels[0], pixels[1])", "self.assertTrue(True)"
-    )
-    assert not audit_image_tests(unused, contract)["passed"]
 
 
 @pytest.mark.sandbox
@@ -274,11 +249,11 @@ async def test_pipeline_repairs_tmp_path_weak_qa_and_canvas_head_confusion(
                 "notes": "Pixel assertions",
             }
         if "decision" in schema["properties"]:
-            if json.JSONDecoder().raw_decode(context)[0].get("phase") == "qa_expectations_review":
+            if role == "Reviewer":
                 counts["test_review"] += 1
                 if counts["test_review"] == 1:
                     return {
-                        "decision": "qa",
+                        "decision": "developer",
                         "findings": ["Canvas must be 200x200"],
                         "size_claims": [
                             {
@@ -332,5 +307,5 @@ async def test_static_ear_feature_is_detected_by_executable_qa(components, setti
         event["data"] for event in failed.value.report["events"] if event["stage"] == "QAExecution"
     ]
     assert len(executions) == 1 and not executions[0]["passed"]
-    assert any("test_edge_ears" in failure for failure in executions[0]["failures"])
+    assert any("test_happy_ears" in failure for failure in executions[0]["failures"])
     assert not extensions.records()

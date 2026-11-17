@@ -106,7 +106,7 @@ async def test_team_rework_routes_and_real_qa(components, monkeypatch):
                 return {"decision": "approve", "findings": []}
             counts["reviewer"] += 1
             return {
-                "decision": ["developer", "qa", "approve"][counts["reviewer"] - 1],
+                "decision": "approve",
                 "findings": ["Repair concrete defect"],
             }
         if "queries" in schema["properties"]:
@@ -120,15 +120,14 @@ async def test_team_rework_routes_and_real_qa(components, monkeypatch):
     )
     assert [event.detail.split(".")[0] for event in progress if event.status == "rework"] == [
         "Передано Developer",
-        "Передано QA",
     ]
-    assert counts == {"developer": 2, "reviewer": 3}
+    assert counts == {"developer": 2, "reviewer": 1}
     assert calls[:4] == ["PM", "Analyst", "Analyst", "PM"]
     assert result["qa"]["passed"] and result["qa"]["tests_run"] == 3
     report = extensions.team.report(result["team_run_id"], 1)
     assert report["status"] == "active" and report["final_spec"] == spec()
     routes = [e["data"]["target"] for e in report["events"] if e["stage"] == "Rework"]
-    assert routes == ["developer", "qa"]
+    assert routes == ["developer"]
     record = extensions.get("doubler")
     assert (extensions.directory(record.manifest) / "tests.py").read_text() == TESTS
     assert await extensions.invoke(record, {"number": -2}, 1) == {"doubled": -4}

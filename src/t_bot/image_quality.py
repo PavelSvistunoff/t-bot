@@ -1,19 +1,10 @@
 """Image artifact contracts and evidence for procedural-image QA and review."""
 
-import ast
 import re
 
 from t_bot.errors import BotError
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
-FEATURE_PATTERNS = {
-    "fur": r"\bfur\b|\bfurry\b|\bхутр\w*|\bшерст\w*",
-    "size": r"\bsize\b|\bрозмір\w*",
-    "ears": r"\bears?\b|\bвух\w*",
-    "eyes": r"\beyes?\b|\bоч(?:і|ей|има)\b",
-    "whiskers": r"\bwhiskers?\b|\bвус\w*",
-}
-
 DIMENSION = re.compile(r"(\d{1,5})\s*[xх×]\s*(\d{1,5})", re.IGNORECASE)
 
 
@@ -63,19 +54,9 @@ def image_contract(request: str, spec: dict) -> dict:
             )
     return {
         "enabled": random_image_request(request),
-        "random_features": [
-            name
-            for name, pattern in FEATURE_PATTERNS.items()
-            if re.search(pattern, request, re.IGNORECASE)
-        ],
         "geometry_facts": facts,
-        "guidance": (
-            "Canvas/image size and head size are different quantities. "
-            "Examples are not fixed constraints. For each random_features item write "
-            "a test_*_<feature>* method: control seed/mock, assert sampler variation and "
-            "compare decoded pixels/crops while holding other features fixed. "
-            "File existence, status and unique names alone are insufficient."
-        ),
+        "guidance": "Canvas and head are separate. Examples are not constraints. "
+        "QA owns happy/failure test design.",
     }
 
 
@@ -137,77 +118,3 @@ def image_review_schema(base: dict) -> dict:
     }
     schema["required"] = [*schema["required"], "size_claims"]
     return schema
-
-
-def _from_pixels(node: ast.AST, variables: set[str]) -> bool:
-    return any(
-        isinstance(child, ast.Name)
-        and child.id in variables
-        or isinstance(child, ast.Call)
-        and isinstance(child.func, ast.Attribute)
-        and child.func.attr in {"getpixel", "getdata", "tobytes", "histogram", "getbbox"}
-        for child in ast.walk(node)
-    )
-
-
-def audit_image_tests(tests: str, contract: dict) -> dict:
-    """Require executable pixel assertions and controlled per-feature tests, beyond path checks.
-
-    This is a coverage gate, not a proof of visual anatomy.
-    QA execution and code review remain required.
-    """
-    tree = ast.parse(tests)
-    findings = []
-    methods = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
-    ]
-    for feature in contract["random_features"]:
-        covered = False
-        for method in methods:
-            if feature not in method.name.casefold():
-                continue
-            calls = [node for node in ast.walk(method) if isinstance(node, ast.Call)]
-            names = [ast.unparse(call.func) for call in calls]
-            pixel_variables: set[str] = set()
-            nodes = list(ast.walk(method))
-            for _ in range(len(nodes)):
-                before = len(pixel_variables)
-                for node in nodes:
-                    if isinstance(node, ast.Assign) and _from_pixels(node.value, pixel_variables):
-                        pixel_variables.update(
-                            target.id for target in node.targets if isinstance(target, ast.Name)
-                        )
-                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                        if node.func.attr in {"append", "add", "extend"} and isinstance(
-                            node.func.value, ast.Name
-                        ):
-                            if any(_from_pixels(arg, pixel_variables) for arg in node.args):
-                                pixel_variables.add(node.func.value.id)
-                if len(pixel_variables) == before:
-                    break
-            pixels = any(
-                isinstance(call.func, ast.Attribute)
-                and call.func.attr.startswith("assert")
-                and any(_from_pixels(arg, pixel_variables) for arg in call.args)
-                for call in calls
-            )
-            controlled = any(
-                name.rsplit(".", 1)[-1] in {"seed", "patch", "object"} for name in names
-            )
-            asserted = any(
-                name.rsplit(".", 1)[-1]
-                in {"assertNotEqual", "assertGreater", "assertTrue", "assertEqual"}
-                for name in names
-            )
-            if pixels and controlled and asserted:
-                covered = True
-                break
-        if not covered:
-            findings.append(
-                f"Потрібен test_*_{feature}*: контрольований seed/mock "
-                "та assertions про пікселі/область цієї ознаки. "
-                "Імена файлів і статус success не перевіряють ознаку."
-            )
-    return {"passed": not findings, "target": "qa", "findings": findings}

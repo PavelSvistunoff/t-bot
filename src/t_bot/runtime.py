@@ -250,7 +250,7 @@ class AgentRuntime:
     ) -> dict:
         """Build through PM, Analyst/web research, PM approval, Developer, QA and Reviewer.
 
-        Activation requires executed happy/failure/edge tests and reviewer approval.
+        Activation requires executed happy/failure tests and Developer code approval.
         Failures return a saved team report instead of activating unverified code.
 
         kind: tool, agent, subagent. extension_id: unique lowercase Python identifier.

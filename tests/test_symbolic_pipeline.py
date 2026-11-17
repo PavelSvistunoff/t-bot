@@ -1,13 +1,12 @@
-import copy
 import json
 from unittest.mock import AsyncMock
 
 import pytest
 
 from t_bot.candidate_validation import verify_smoke_result
-from t_bot.extension_team import SPEC_SCHEMA, TeamFailure
+from t_bot.extension_team import SPEC_SCHEMA
 from t_bot.manifest import Manifest
-from t_bot.qa_expectations import NoProgressGuard, audit_tests
+from t_bot.qa_expectations import NoProgressGuard
 from t_bot.sandbox_worker import symbolic_references
 
 pytestmark = pytest.mark.team
@@ -111,18 +110,6 @@ def test_exact_sympy_domain_and_constants_are_used_without_eval(tmp_path):
     assert not marker.exists()
 
 
-def test_audit_does_not_replace_symbolic_singularity_with_float_approximation():
-    oracle = symbolic_references(["sqrt(16)", "tan(pi/2)"])
-    audit = audit_tests(
-        REQUEST, specification(), TESTS, semantics="sympy", references=oracle["values"]
-    )
-    assert audit["passed"]
-    assert audit["reference_checks"][0]["reference"] == 4
-    assert audit["semantics"] == "sympy"
-    # Missing reference data is unknown, never a claim that tan(pi/2) is a valid finite value.
-    assert audit_tests(REQUEST, specification(), TESTS)["passed"]
-
-
 @pytest.mark.parametrize(
     "result", [{"error": "Float has no attribute is_nan"}, {"success": False}, {"status": "failed"}]
 )
@@ -184,72 +171,6 @@ async def test_is_nan_error_is_repaired_before_qa_and_symbolic_tests_pass(compon
     assert "is_nan" in validations[0]["validation_error"]
     assert validations[1]["smoke_result"]["numeric_result"] == 4
     assert report["last_valid_candidate"]["source"].count("is_nan") == 0
-
-
-async def test_changed_candidates_and_tests_cannot_hide_global_stall(
-    components, settings, monkeypatch
-):
-    _, extensions, _, _ = components
-    research(extensions.team, monkeypatch)
-    settings.extension_team_max_rounds = 30
-    settings.extension_team_max_calls = 100
-    settings.extension_team_no_progress_limit = 3
-    counts = {"developer": 0, "qa": 0, "review": 0}
-
-    async def ask(role, model, context, schema):
-        if role == "Developer":
-            counts["developer"] += 1
-            candidate = artifact()
-            candidate["manifest"]["dependencies"] = []
-            candidate["source"] = f"VERSION = {counts['developer']}\n" + candidate[
-                "source"
-            ].replace("BROKEN_CHECK", "pass")
-            return candidate
-        if "queries" in schema["properties"]:
-            return {"queries": ["Math documentation"]}
-        if "tests" in schema["properties"]:
-            counts["qa"] += 1
-            return {
-                "tests": f"QA_VERSION = {counts['qa']}\n" + TESTS.replace("tan(pi/2)", "1/0"),
-                "notes": "Tests",
-            }
-        if "decision" in schema["properties"]:
-            counts["review"] += 1
-            return {"decision": "pm", "findings": [f"Different wording {counts['review']}"]}
-        return specification()
-
-    monkeypatch.setattr(extensions.team.roles, "ask", ask)
-    execute = AsyncMock()
-    with pytest.raises(TeamFailure) as failed:
-        await extensions.team.run(
-            request=REQUEST,
-            extension_id="symbolic_calc",
-            user_id=1,
-            model="fake",
-            developer_context="Implement",
-            developer_schema={},
-            validate=AsyncMock(side_effect=lambda value: copy.deepcopy(value)),
-            execute_tests=execute,
-        )
-    report = failed.value.report
-    assert "Немає прогресу" in report["error"]
-    assert counts == {"developer": 4, "qa": 4, "review": 4}
-    assert not any(event["stage"] == "Stagnation" for event in report["events"])
-    assert report["last_valid_candidate"]
-    assert report["stage"] == "NoProgress"
-    assert execute.await_count == 0
-
-
-def test_number_expectation_for_symbolic_singularity_is_rejected():
-    tests = """class Tests:
-    def test_edge_singularity(self):
-        response = invoke({"text": "tan(pi/2)"})
-        self.assertEqual(response["result"], 1.633123935319537e16)
-"""
-    oracle = symbolic_references(["tan(pi/2)"])
-    audit = audit_tests(REQUEST, specification(), tests, references=oracle["values"])
-    assert not audit["passed"] and audit["target"] == "qa"
-    assert "SymPy" in audit["findings"][0]
 
 
 def test_smoke_checks_numeric_value_independently_of_result_field_name():

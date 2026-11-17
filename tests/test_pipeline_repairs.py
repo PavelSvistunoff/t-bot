@@ -111,6 +111,9 @@ async def test_report_case_repairs_pm_and_qa_without_rewriting_valid_code(compon
             if counts["qa_write"] > 1:
                 assert "11.940648784182015" in context
             return {"tests": TESTS.replace("EXPECTED", expected), "notes": "Check numeric oracle"}
+        if role == "QA" and "test_results" in context:
+            execution = json.JSONDecoder().raw_decode(context)[0]["test_results"]
+            return {"decision": "approve" if execution["passed"] else "qa", "findings": []}
         return {"decision": "approve", "findings": []}
 
     monkeypatch.setattr(extensions.team.roles, "ask", ask)
@@ -122,7 +125,7 @@ async def test_report_case_repairs_pm_and_qa_without_rewriting_valid_code(compon
     report = extensions.team.report(result["team_run_id"], 1)
     assert len(report["spec_revisions"]) == 2
     assert report["last_valid_candidate"]["source"] == SOURCE
-    assert any(e["stage"] == "QAExpectations" and not e["data"]["passed"] for e in report["events"])
+    assert any(e["stage"] == "QAExecution" and not e["data"]["passed"] for e in report["events"])
 
 
 async def test_invalid_attempt_does_not_replace_last_valid_candidate(
@@ -224,51 +227,6 @@ async def test_repeated_unresolved_failures_stop_before_round_limit(
     ] == ["qa", "pm", "pm"]
 
 
-@pytest.mark.parametrize("target,developers", [("qa", 1), ("pm", 2)])
-async def test_independent_oracle_review_routes_before_test_execution(
-    components, monkeypatch, target, developers
-):
-    _, extensions, _, _ = components
-    research(extensions.team, monkeypatch)
-    counts = {"developer": 0, "review": 0, "pm_revision": 0}
-
-    async def ask(role, model, context, schema):
-        if role == "Developer":
-            counts["developer"] += 1
-            return candidate()
-        if role == "PM" and "current_spec" in context:
-            counts["pm_revision"] += 1
-        if "queries" in schema["properties"]:
-            return {"queries": ["Python docs"]}
-        if "tests" in schema["properties"]:
-            return {"tests": TESTS.replace("EXPECTED", "11.940648784182015"), "notes": "Tests"}
-        if "decision" in schema["properties"]:
-            data = json.loads(context)
-            if data.get("phase") == "qa_expectations_review":
-                assert "source" not in context
-                counts["review"] += 1
-                if counts["review"] == 1:
-                    return {"decision": target, "findings": ["Clarify the expected behavior"]}
-            return {"decision": "approve", "findings": []}
-        return spec()
-
-    monkeypatch.setattr(extensions.team.roles, "ask", ask)
-    execute = AsyncMock(return_value={"passed": True, "tests_run": 3})
-    result = await extensions.team.run(
-        request=REQUEST,
-        extension_id="calc_repair",
-        user_id=1,
-        model="fake",
-        developer_context="Implement",
-        developer_schema={},
-        validate=AsyncMock(side_effect=lambda value: value),
-        execute_tests=execute,
-    )
-    assert result["qa"]["passed"]
-    assert counts == {"developer": developers, "review": 2, "pm_revision": int(target == "pm")}
-    assert execute.await_count == 1
-
-
 @pytest.mark.sandbox
 @pytest.mark.parametrize("repair_succeeds", [True, False])
 async def test_pm_semantic_failure_uses_fallback_instead_of_repeating_report_loop(
@@ -312,6 +270,9 @@ async def test_pm_semantic_failure_uses_fallback_instead_of_repeating_report_loo
             return candidate()
         if "tests" in schema["properties"]:
             return {"tests": TESTS.replace("EXPECTED", "11.940648784182015"), "notes": "Tests"}
+        if role == "QA" and "test_results" in context:
+            execution = json.JSONDecoder().raw_decode(context)[0]["test_results"]
+            return {"decision": "approve" if execution["passed"] else "qa", "findings": []}
         return {"decision": "approve", "findings": []}
 
     monkeypatch.setattr(extensions.team.roles, "ask", ask)
@@ -345,61 +306,6 @@ async def test_pm_semantic_failure_uses_fallback_instead_of_repeating_report_loo
         event["stage"] == "PM" and "ТЗ не виправлено" in event["data"].get("error", "")
         for event in report["events"]
     )
-
-
-async def test_rephrased_reviewer_cannot_loop_on_unchanged_code_and_tests(
-    components,
-    settings,
-    monkeypatch,
-):
-    _, extensions, _, _ = components
-    research(extensions.team, monkeypatch)
-    settings.extension_team_max_rounds = 30
-    settings.extension_team_max_calls = 100
-    settings.extension_team_stagnation_limit = 2
-    reviews = []
-
-    async def ask(role, model, context, schema):
-        if role == "Developer":
-            return candidate()
-        if "queries" in schema["properties"]:
-            return {"queries": ["Python math documentation"]}
-        if "tests" in schema["properties"]:
-            tests = "import math\n" + TESTS.replace(
-                "EXPECTED", "7 + 5 + math.sin(7) - 1 + math.cos(5)"
-            )
-            return {"tests": f"# Retry {len(reviews)}\n" + tests, "notes": "Math oracles"}
-        if "decision" in schema["properties"]:
-            data = json.loads(context)
-            assert data["phase"] == "qa_expectations_review"
-            assert all(item["matched"] for item in data["trusted_checks"]["reference_checks"])
-            reviews.append(f"Reworded precision concern {len(reviews)}")
-            return {"decision": "qa", "findings": [reviews[-1]]}
-        return spec()
-
-    monkeypatch.setattr(extensions.team.roles, "ask", ask)
-    execute = AsyncMock()
-    with pytest.raises(TeamFailure) as failed:
-        await extensions.team.run(
-            request="Створи інструмент для обчислення складних математичних виразів через math.",
-            extension_id="calc_repair",
-            user_id=1,
-            model="fake",
-            developer_context="Implement",
-            developer_schema={},
-            validate=AsyncMock(side_effect=lambda value: value),
-            execute_tests=execute,
-        )
-    report = failed.value.report
-    assert "Зациклення" in report["error"]
-    assert len(reviews) == len(set(reviews)) == 6
-    assert report["last_valid_candidate"]["source"] == SOURCE
-    assert execute.await_count == 0
-    stagnation = [event["data"] for event in report["events"] if event["stage"] == "Stagnation"]
-    assert all(event["basis"] == "artifacts" for event in stagnation)
-    assert {event["state"]["phase"] for event in stagnation} == {"test_review"}
-    assert [event["target"] for event in stagnation] == ["pm", "pm", "pm"]
-    assert stagnation[-1]["stop"]
 
 
 @pytest.mark.sandbox
@@ -436,6 +342,9 @@ async def test_ukrainian_spec_and_dynamic_oracle_repairs_activate_valid_candidat
             if counts["qa"] == 1:
                 expected += " + 1"
             return {"tests": "import math\n" + TESTS.replace("EXPECTED", expected), "notes": "Math"}
+        if role == "QA" and "test_results" in context:
+            execution = json.JSONDecoder().raw_decode(context)[0]["test_results"]
+            return {"decision": "approve" if execution["passed"] else "qa", "findings": []}
         return {"decision": "approve", "findings": []}
 
     monkeypatch.setattr(extensions.team.roles, "ask", ask)

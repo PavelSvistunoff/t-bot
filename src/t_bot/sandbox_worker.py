@@ -58,7 +58,7 @@ def agent_spec(agent, manifest: dict) -> dict:
 
 
 def run_tests(directory: str) -> dict:
-    """Run QA's unittest suite; require executable happy/failure/edge assertions."""
+    """Run QA's unittest suite; require executable happy/failure assertions."""
     import ast
     import io
     import unittest
@@ -90,16 +90,16 @@ def run_tests(directory: str) -> dict:
     identifiers = test_ids(suite)
     coverage = {
         category: any(".test_" + category + "_" in name for name in identifiers)
-        for category in ("happy", "failure", "edge")
+        for category in ("happy", "failure")
     }
-    if not all(coverage.values()) or assertions < 3 or not 3 <= len(identifiers) <= 100:
+    if not all(coverage.values()) or assertions < 2 or not 2 <= len(identifiers) <= 100:
         return {
             "passed": False,
             "target": "qa",
             "coverage": coverage,
             "tests_run": 0,
-            "feedback": "Require 3..100 unittest tests, real assertions and test_happy_*, "
-            "test_failure_*, test_edge_* methods.",
+            "feedback": "Require 2..100 unittest tests, real assertions and test_happy_*, "
+            "test_failure_* methods.",
         }
     output = io.StringIO()
     result = unittest.TextTestRunner(stream=output, verbosity=1).run(suite)

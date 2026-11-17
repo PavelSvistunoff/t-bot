@@ -158,6 +158,10 @@ def scripted_roles(*, mode, calls):
                     "decision": "developer" if mode == "failed_tests" else "approve",
                     "findings": ["Actual assertion failure"] if mode == "failed_tests" else [],
                 }
+            if mode == "empty_review":
+                if sum(name == "Reviewer" for name, _ in calls) == 1:
+                    return {"decision": "developer", "findings": []}
+                return {"decision": "approve", "findings": []}
             if data.get("phase") == "qa_expectations_review":
                 if mode == "empty_review" and sum(name == "Reviewer" for name, _ in calls) == 1:
                     return {"decision": "qa", "findings": []}
@@ -166,8 +170,7 @@ def scripted_roles(*, mode, calls):
                 assert model == "qwen3-coder:30b"
                 return {"decision": "approve", "findings": []}
             final_reviews = sum(
-                name == "Reviewer" and '"qa_triage"' in ctx and '"supervisor_feedback"' not in ctx
-                for name, ctx in calls
+                name == "Reviewer" and '"supervisor_feedback"' not in ctx for name, ctx in calls
             )
             if mode == "code_bug" and final_reviews > 1:
                 return {"decision": "approve", "findings": []}
@@ -257,7 +260,7 @@ async def test_supervisor_does_not_reset_progress_for_changing_artifacts(
     _, extensions, _, _ = components
     research(extensions.team, monkeypatch)
     settings.extension_team_max_rounds = 30
-    settings.extension_team_max_calls = 100
+    settings.extension_team_max_calls = 90
     settings.extension_team_no_progress_limit = 2
     rounds = []
 
@@ -302,27 +305,23 @@ async def test_supervisor_does_not_reset_progress_for_changing_artifacts(
 async def test_supervisor_shares_existing_model_call_budget(components, settings, monkeypatch):
     _, extensions, _, _ = components
     research(extensions.team, monkeypatch)
-    settings.extension_team_max_calls = 10
+    settings.extension_team_max_calls = 9
     calls = []
     monkeypatch.setattr(
         extensions.team.roles, "ask", scripted_roles(mode="repair_review", calls=calls)
     )
     with pytest.raises(TeamFailure) as failed:
         await extensions.create("Double integers", "tool", "supervised_double", "root", "", 1)
-    assert failed.value.report["calls"] == 10
+    assert failed.value.report["calls"] == 9
     assert "бюджет" in failed.value.report["error"]
     assert not extensions.records()
 
 
-def test_verified_numeric_objection_is_arbitrated_but_ordinary_feedback_is_not():
-    context = {
-        "trusted_checks": {"reference_checks": [{"test": "test_happy_numeric", "matched": True}]}
-    }
-    review = {"decision": "qa", "findings": ["test_happy_numeric has a precision problem"]}
-    assert DevelopmentSupervisor.needs_arbitration(review, context)
-    assert not DevelopmentSupervisor.needs_arbitration(
-        {"decision": "qa", "findings": ["Missing failure coverage"]}, context
-    )
+def test_reviewer_cannot_delegate_test_quality_to_qa():
+    with pytest.raises(BotError, match="якість тестів"):
+        DevelopmentSupervisor.check_review(
+            {"decision": "qa", "findings": ["Change test assertions"]}
+        )
 
 
 @pytest.mark.parametrize(
@@ -330,7 +329,7 @@ def test_verified_numeric_objection_is_arbitrated_but_ordinary_feedback_is_not()
 )
 def test_placeholder_rejections_are_returned_to_reviewer(findings):
     with pytest.raises(BotError, match="Reviewer"):
-        DevelopmentSupervisor.check_review({"decision": "qa", "findings": findings})
+        DevelopmentSupervisor.check_review({"decision": "developer", "findings": findings})
 
 
 @pytest.mark.sandbox
