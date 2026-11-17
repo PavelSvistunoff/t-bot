@@ -11,7 +11,7 @@ from typing import Literal
 from uuid import uuid4
 
 import jsonschema
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, Field
 
 from t_bot.config import Settings
 from t_bot.dependencies import validate_requests
@@ -295,19 +295,19 @@ class Extensions:
     ) -> dict:
         self.settings.authorize(user_id)
         model = model or self.store.get("model:root", self.settings.default_model)
-        base = Manifest(
-            id=extension_id,
-            kind=kind,  # type: ignore[arg-type]
-            version=self.next_version(extension_id),
-            description=request[:2000],
-            parent=parent,
-            model=model,
-            entrypoint="invoke" if kind == "tool" else "build_agent",
-            example_usage=request[:2000],
-            dependencies=[],
-            permissions=TypeAdapter(list[Literal["workspace", "network"]]).validate_python(
-                permissions if permissions is not None else ["workspace", "network"]
-            ),
+        base = Manifest.model_validate(
+            {
+                "id": extension_id,
+                "kind": kind,
+                "version": self.next_version(extension_id),
+                "description": request[:2000],
+                "parent": parent,
+                "model": model,
+                "entrypoint": "invoke" if kind == "tool" else "build_agent",
+                "example_usage": request[:2000],
+                "dependencies": [],
+                "permissions": permissions if permissions is not None else ["workspace", "network"],
+            }
         )
         if dependencies is not None:
             requests = validate_requests(dependencies)

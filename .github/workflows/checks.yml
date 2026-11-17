@@ -18,5 +18,5 @@ jobs:
       - run: uv sync --frozen --python 3.12
       - run: uv run ruff check src tests examples
       - run: uv run ruff format --check src tests examples
-      - run: uv run mypy src
+      - run: uv run mypy --no-incremental src
       - run: uv run pytest -q -m 'not live'

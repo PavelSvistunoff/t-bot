@@ -409,7 +409,7 @@ GitHub Actions запускає перевірки на macOS для систе�
 uv sync --frozen
 uv run ruff check src tests
 uv run ruff format --check src tests
-uv run mypy src
+uv run mypy --no-incremental src
 uv run pytest -q -m 'not live'
 RUN_LIVE=1 uv run pytest -q -m live
 ```
