@@ -139,3 +139,84 @@ def test_reviewer_cannot_grade_qa_in_freeform_prose(finding):
 
     with pytest.raises(BotError, match="QA"):
         DevelopmentSupervisor.check_review({"decision": "developer", "findings": [finding]})
+
+
+@pytest.mark.parametrize(
+    "quote",
+    [
+        "the operators +, -, * and / work as expected; parentheses () can be used for grouping.",
+        "the\toperators +, -,\r\n* and / work as expected; "
+        "parentheses\u00a0() can be used for grouping.",
+    ],
+)
+def test_web_quotes_4336_accept_whitespace_changes_only(quote):
+    page = {
+        "url": "https://www.python.org/",
+        "text": "the operators +, -,\n* and / work as expected; "
+        "parentheses\n() can be used for grouping.",
+    }
+    analysis = {"source_checks": [{"conclusion": "Arithmetic", "url": page["url"], "quote": quote}]}
+    validate_analysis(analysis, [page])
+
+
+def test_web_quote_failure_points_to_relevant_excerpt_and_correct_url():
+    url = "https://docs.python.org/arithmetic"
+    text = "Navigation menu " * 150 + "17 / 3 # true division returns a float\n5.666666666666667"
+    analysis = {
+        "source_checks": [
+            {
+                "conclusion": "Division returns float",
+                "url": url,
+                "quote": "17 / 3 # true division returns an integer 5",
+            }
+        ]
+    }
+    with pytest.raises(EvidenceError) as failure:
+        validate_analysis(analysis, [{"url": url, "text": text}])
+    message = str(failure.value)
+    assert url in message
+    assert "true division returns a float" in message
+    assert "5.666666666666667" in message
+    assert "Navigation menu " * 20 not in message
+
+
+@pytest.mark.parametrize("quote", ["Numbers 20 and 5", "Numbers 10 ... 5"])
+def test_whitespace_matching_never_accepts_changed_numbers_or_paraphrase(quote):
+    page = {"url": "https://docs.python.org/", "text": "Numbers 10\nand 5"}
+    with pytest.raises(EvidenceError):
+        validate_analysis(
+            {"source_checks": [{"conclusion": "Compute", "url": page["url"], "quote": quote}]},
+            [page],
+        )
+
+
+def test_code_quotes_remain_exact_including_indentation():
+    with pytest.raises(EvidenceError):
+        validate_advice(
+            {
+                "action": "developer",
+                "reason": "Inspect",
+                "evidence": [
+                    {
+                        "pointer": "/implementation/source",
+                        "quote": 'if operator == "divide": return a / b',
+                    }
+                ],
+            },
+            CONTEXT,
+            {"developer"},
+        )
+
+
+@pytest.mark.parametrize(
+    "objective",
+    [
+        "Extract Python version release dates and download links",
+        "Extract the verbatim text from JSON and repair its quote",
+    ],
+)
+def test_analyst_4336_cannot_replace_calculator_goal(objective):
+    with pytest.raises(EvidenceError) as failure:
+        validate_analysis({"objective": objective}, [], expected_objective="Create a calculator")
+    assert failure.value.failure_kind == "analyst_objective"
+    assert "Create a calculator" in str(failure.value)

@@ -491,3 +491,42 @@ async def test_reviewer_repair_never_receives_qa_advice_or_results(components, m
     assert result["status"] == "active"
     assert len(repaired) == 1
     assert sum(role == "QA" and '"previous_tests"' in context for role, context in calls) == 1
+
+
+@pytest.mark.sandbox
+async def test_analyst_preserves_goal_during_citation_repair(components, monkeypatch):
+    _, extensions, _, _ = components
+    research(extensions.team, monkeypatch)
+    calls = []
+    callback = scripted_roles(mode="empty_review", calls=calls)
+    revisions = []
+    monkeypatch.setattr(
+        extensions.team.webpages,
+        "read",
+        AsyncMock(
+            return_value={
+                "url": "https://docs.python.org/3/",
+                "text": "Official Python\n documentation",
+            }
+        ),
+    )
+
+    async def ask(role, model, context, schema):
+        if role == "Analyst" and "source_checks" in schema["properties"]:
+            data = json.JSONDecoder().raw_decode(context)[0]
+            revisions.append(data)
+            assert data["user_request"] == "Double integers"
+            assert schema["properties"]["objective"]["const"] == spec()["objective"]
+            result = spec()
+            if len(revisions) == 1:
+                result["objective"] = "Extract release dates from Python downloads"
+            return result
+        return await callback(role, model, context, schema)
+
+    monkeypatch.setattr(extensions.team.roles, "ask", ask)
+    result = await extensions.create("Double integers", "tool", "supervised_double", "root", "", 1)
+    assert result["status"] == "active"
+    assert len(revisions) == 2
+    report = extensions.team.report(result["team_run_id"], 1)
+    assert report["final_spec"]["objective"] == spec()["objective"]
+    assert any("початкова мета" in event["data"].get("error", "") for event in report["events"])
